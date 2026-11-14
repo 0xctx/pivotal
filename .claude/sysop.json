@@ -1,0 +1,4 @@
+{
+  "check": "python3 test/run_suite.py",
+  "check_timeout": 3000
+}

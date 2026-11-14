@@ -1,0 +1,90 @@
+# The reusable land job (F4): "land it" re-verifies the seal, then moves the base by the sealed commit only.
+# Called by templates/caller.yml for a trusted `/pivotal land`, with the issue (the one a pull request closes, or the issue itself)
+# and the release SHA the engine is checked out at (a reusable workflow cannot read its own SHA). No secret: landing needs the repo
+# token, not a model key.
+#
+# The one job holds a GitHub write token (contents, pull-requests, issues) and runs only git and gh on data it validated, through
+# engine/land.py: never repo code, never model output, and the repo is not even checked out (F1). `actions: read` and `checks: read`
+# let it read the seal's run, its artifacts and the check runs of the commit. The caller grants exactly these, and a called
+# workflow can only narrow them. Untrusted text reaches the engine only through `env:` (F2).
+#
+# Concurrency: one land per repository at a time and none dropped (`cancel-in-progress: false`, `queue: max`; actionlint 1.7.12
+# predates the key, ci.yml ignores that one message for this file and the caller). A second land finds the base moved and re-gates.
+# There is no `if: !cancelled()`: the job has no `needs`, and a run that /pivotal stop cancelled must NOT land (F6), which the
+# default `success()` of every step gives. A land commented on the stack pull request is titled with the pull request's number
+# (the caller's run-name reads the event) but queued in the issue's group; the caller's stop job looks the issue's stack pull
+# request up (`pull-requests: read`, its only read) and cancels the runs titled with either number.
+name: land
+
+on:
+  workflow_call:
+    inputs:
+      issue:
+        type: string
+        required: true
+      # The release SHA of the engine, the same pin as the `uses:` reference (the caller passes it).
+      engine_sha:
+        type: string
+        required: true
+      # The engine repository to check out (the same OWNER/REPO as the caller's pinned `uses:` path).
+      engine_repo:
+        type: string
+        required: true
+    outputs:
+      outcome:
+        description: "landed, regate or not_landed"
+        value: ${{ jobs.land.outputs.outcome }}
+      sealed_sha:
+        description: "The sealed commit the job acted on, or empty"
+        value: ${{ jobs.land.outputs.sealed_sha }}
+
+permissions: {}
+
+jobs:
+  land:
+    name: land
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: pivotal-land-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      outcome: ${{ steps.land.outputs.land_outcome }}
+      sealed_sha: ${{ steps.land.outputs.sealed_sha }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Verify the seal, then land the sealed commit
+        id: land
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ inputs.issue }}
+          LEVEL: ${{ vars.PIVOTAL_LEVEL }}
+          WORK_DIR: ${{ runner.temp }}/land-work
+        # exec: the Python process IS the step process, so no bash parent keeps the token in its environment. The runner sets
+        # GITHUB_EVENT_NAME, GITHUB_EVENT_PATH (the caller's issue_comment event, which trust is asked about again),
+        # GITHUB_SERVER_URL and GITHUB_OUTPUT.
+        run: exec python3 -I pivotal/engine/land.py run

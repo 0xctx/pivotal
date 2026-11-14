@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "workers": {
+    "claude": {
+      "npm": "@anthropic-ai/claude-code-linux-x64",
+      "version": "2.1.312",
+      "bin": "node_modules/@anthropic-ai/claude-code-linux-x64/claude",
+      "platform": "linux-x64"
+    },
+    "pi": {
+      "npm": "@earendil-works/pi-coding-agent",
+      "version": "1.1.0",
+      "bin": "node_modules/.bin/pi",
+      "node_min": "22.19.0"
+    },
+    "omp": {
+      "url": "https://github.com/can1357/oh-my-pi/releases/download/v18.20.0/omp-linux-x64",
+      "version": "18.20.0",
+      "bin": "omp",
+      "platform": "linux-x64",
+      "sha256": "c8694be8c6e6a1f45e3636dd8a8e9eaa78878ad629a89000b403ec5e456d3f89"
+    }
+  },
+  "unavailable": {
+    "agy": "not supported: its headless call was unreliable on a hosted runner, so it has no pin (docs/engines.md)",
+    "codex": "not measured (docs/engines.md)",
+    "grok": "not measured (docs/engines.md)"
+  }
+}

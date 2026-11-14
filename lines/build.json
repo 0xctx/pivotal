@@ -1,0 +1,6 @@
+{
+  "name": "build",
+  "summary": "The standard brief: implement the slice, with tests, and stop.",
+  "prompt": "build.md",
+  "gate": "standard"
+}

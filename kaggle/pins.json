@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "note": "What the serve notebook fetches while it holds the ngrok token and the endpoint key, pinned. THESE VALUES ARE CURRENT AS OF 2026-11-01 (public PyPI, GitHub releases and Hugging Face model API; the sysop sessions of that day ran the same things unpinned, so these are what was current when they worked). THEY ARE NOT YET CONFIRMED BY A LIVE NOTEBOOK RUN: models-up confirms them (the notebook installs and builds exactly these) and records the result. kaggle/render.py refuses to render a null or malformed pin. Only the top-level packages are pinned, not their dependencies (accepted, see the build report).",
+  "fetched": "2026-11-01",
+  "confirmed_by_live_run": false,
+  "ngrok": "1.7.0",
+  "huggingface_hub": "2.4.0",
+  "llama_cpp": {
+    "tag": "v0.8.0",
+    "commit": "8642541b255bfb5dc39cd351a178be09013a55d6",
+    "sha256": "1688a167a8edd9499cdd0c19b8bd044f0fa184b466981977bbf2222d884953a4"
+  },
+  "model_revisions": {
+    "qwen3.6-35b-a3b": "a483e9e6cbd595906af30beda3187c2663a1118c",
+    "qwen3.8-27b": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+    "gemma-4-26b-a4b": "d1c082be9cf3c8a514acf63b8761f4b41935842e"
+  }
+}

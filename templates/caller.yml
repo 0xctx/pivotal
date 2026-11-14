@@ -1,0 +1,213 @@
+# The one workflow file piv init adds to each repo. Every trigger enters here.
+# trust decides who the trigger is from before any job gets a secret (F2b): only factory-trusted
+# receives subscription secrets. The reusable workflows are pinned to a release SHA, which piv init
+# writes in place of the placeholder zeros, so an unedited copy fails closed. engine_sha is the same
+# release SHA: factory.yml checks its engine out at it (a reusable workflow cannot read its own SHA).
+name: pivotal
+
+run-name: "pivotal-issue-${{ github.event.issue.number || github.event.client_payload.issue || 'none' }}"
+
+on:
+  issues:
+    types: [labeled]
+  # issue_comment and workflow_run are the two triggers zizmor calls dangerous. Both are needed.
+  # They are safe here because trust decides first, and no job checks out the event's head.
+  issue_comment: # zizmor: ignore[dangerous-triggers]
+    types: [created]
+  repository_dispatch:
+    types: [pivotal-event, pivotal-fix]
+  workflow_dispatch:
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [CI] # piv init lists the repo's CI workflows by name
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  trust:
+    # No secrets. A workflow_run acts only for a push failure on this repo's default branch.
+    name: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+      github.event.workflow_run.conclusion == 'failure')
+    permissions:
+      contents: read
+      issues: read
+      # Read only: trust reads the pull request a /pivotal land comment is on, for the issue it closes (I4).
+      pull-requests: read
+    outputs:
+      trusted: ${{ steps.decide.outputs.trusted }}
+      issue: ${{ steps.decide.outputs.issue }}
+      kind: ${{ steps.decide.outputs.kind }}
+      # The sha256 of the issue's title and body as trust saw them. An empty pin means refuse (R3).
+      pin: ${{ steps.decide.outputs.pin }}
+    steps:
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: __PIVOTAL_ENGINE__
+          ref: "0000000000000000000000000000000000000000"
+          path: pivotal
+          persist-credentials: false
+      - name: Decide trust
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I pivotal/engine/trust.py >> "$GITHUB_OUTPUT"
+
+  factory-trusted:
+    # Every Pivotal secret. Only a trusted go, fix, event or incident gets them.
+    name: factory (trusted)
+    needs: trust
+    if: needs.trust.outputs.trusted == 'true' && contains(fromJSON('["go","fix","event","incident"]'), needs.trust.outputs.kind)
+    concurrency:
+      group: pivotal-issue-${{ needs.trust.outputs.issue }}
+      queue: max
+    permissions:
+      checks: write
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: __PIVOTAL_ENGINE__/.github/workflows/factory.yml@0000000000000000000000000000000000000000
+    with:
+      engine_repo: "__PIVOTAL_ENGINE__"
+      trusted: ${{ needs.trust.outputs.trusted == 'true' }}
+      kind: ${{ needs.trust.outputs.kind }}
+      issue: ${{ needs.trust.outputs.issue }}
+      issue_pin: ${{ needs.trust.outputs.pin }}
+      engine_sha: "0000000000000000000000000000000000000000"
+      preset: ${{ vars.PIVOTAL_PRESET }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      PIVOTAL_KAGGLE_URL: ${{ secrets.PIVOTAL_KAGGLE_URL }}
+      PIVOTAL_KAGGLE_KEY: ${{ secrets.PIVOTAL_KAGGLE_KEY }}
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+
+  factory-untrusted:
+    # A stranger's issue: only the free keys and the Kaggle endpoint, on PIVOTAL_UNTRUSTED_PRESET.
+    # The write grants below are a ceiling that factory.yml can only narrow. factory.yml must keep
+    # every job that runs model output or repo code at contents: read (F1); only its publishing steps
+    # may write.
+    name: factory (untrusted)
+    needs: trust
+    if: needs.trust.outputs.trusted != 'true' && needs.trust.outputs.kind == 'go'
+    concurrency:
+      group: pivotal-issue-${{ needs.trust.outputs.issue }}
+      queue: max
+    permissions:
+      checks: write
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: __PIVOTAL_ENGINE__/.github/workflows/factory.yml@0000000000000000000000000000000000000000
+    with:
+      engine_repo: "__PIVOTAL_ENGINE__"
+      trusted: ${{ needs.trust.outputs.trusted == 'true' }}
+      kind: ${{ needs.trust.outputs.kind }}
+      issue: ${{ needs.trust.outputs.issue }}
+      issue_pin: ${{ needs.trust.outputs.pin }}
+      engine_sha: "0000000000000000000000000000000000000000"
+      preset: ${{ vars.PIVOTAL_UNTRUSTED_PRESET }}
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      PIVOTAL_KAGGLE_URL: ${{ secrets.PIVOTAL_KAGGLE_URL }}
+      PIVOTAL_KAGGLE_KEY: ${{ secrets.PIVOTAL_KAGGLE_KEY }}
+
+  land:
+    # Trusted only, and no secret: landing needs the repo token, not a model key.
+    name: land
+    needs: trust
+    if: needs.trust.outputs.trusted == 'true' && needs.trust.outputs.kind == 'land'
+    concurrency:
+      group: pivotal-issue-${{ needs.trust.outputs.issue }}
+      queue: max
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: __PIVOTAL_ENGINE__/.github/workflows/land.yml@0000000000000000000000000000000000000000
+    with:
+      engine_repo: "__PIVOTAL_ENGINE__"
+      issue: ${{ needs.trust.outputs.issue }}
+      engine_sha: "0000000000000000000000000000000000000000"
+
+  stop:
+    # Trusted only, no secret, and no concurrency group: it must not queue behind the run it cancels.
+    name: stop
+    needs: trust
+    if: needs.trust.outputs.trusted == 'true' && needs.trust.outputs.kind == 'stop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Cancel this issue's runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          ISSUE: ${{ needs.trust.outputs.issue }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -o pipefail
+          # The workflow file this run belongs to, so no file name is written into the template.
+          workflow="${WORKFLOW_REF%@*}"
+          workflow="${workflow##*/}"
+          # A land commented on the issue's stack pull request is titled with the pull request's number (run-name reads the
+          # event), while its group is the issue's: the stop cancels the runs titled with either. The read is this job's only.
+          # A lookup that fails must not leave the issue's own runs running: it is recorded, the runs titled with the issue
+          # are still cancelled, and the step ends red.
+          lookup_failed=0
+          listing_failed=0
+          PRS=$(gh pr list --state all --head "pivotal/issue-$ISSUE/stack" --json number --jq '.[].number' | paste -sd, -) || lookup_failed=1
+          export PRS
+          # Every page of each state a run can be cancelled from, so no run past the first 100 is missed.
+          # A listing is tried up to three times (a 5xx is usually brief) before it counts as failed; a listing that still
+          # fails is recorded and the later statuses are still listed and cancelled; the step ends red and that status's
+          # runs are left running. A cancel that fails is reported and the loop goes on.
+          list_runs() {
+            local attempt=1
+            # shellcheck disable=SC2016  # $t is a jq variable, not a shell one
+            local filter='.workflow_runs[] | select(.display_title as $t | ([env.ISSUE] + (env.PRS | split(",") | map(select(. != "")))) | any("pivotal-issue-" + . == $t)) | .id'
+            until runs=$(gh api --paginate "repos/$GH_REPO/actions/workflows/$workflow/runs?status=$1&per_page=100" --jq "$filter"); do
+              [ "$attempt" -lt 3 ] || return 1
+              attempt=$((attempt + 1))
+              sleep "${LISTING_RETRY_SLEEP:-2}"
+            done
+          }
+          for status in queued in_progress waiting requested pending; do
+            if list_runs "$status"; then
+              while read -r run; do
+                if [ -n "$run" ] && [ "$run" != "$RUN_ID" ]; then
+                  gh run cancel "$run" || echo "could not cancel run $run; it may have finished" >&2
+                fi
+              done <<< "$runs"
+            else
+              listing_failed=1
+            fi
+          done
+          if [ "$lookup_failed" -ne 0 ]; then
+            echo "could not look up the stack pull request; runs titled with its number were not cancelled" >&2
+          fi
+          if [ "$listing_failed" -ne 0 ]; then
+            echo "could not list some runs; they were not cancelled" >&2
+          fi
+          if [ "$lookup_failed" -ne 0 ] || [ "$listing_failed" -ne 0 ]; then
+            exit 1
+          fi

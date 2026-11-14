@@ -1,0 +1,7 @@
+{
+  "name": "incident",
+  "summary": "Reproduce the failure, find the root cause, make the minimal fix with a regression test. The brief has the link, never the alert text.",
+  "prompt": "incident.md",
+  "gate": "standard",
+  "request": "link"
+}

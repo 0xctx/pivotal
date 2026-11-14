@@ -1,0 +1,55 @@
+# Pivotal's own CI. Every tool here is pinned: the action by commit SHA, the linters by version.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: unit tests, shellcheck, actionlint, zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install lint tools (pinned)
+        run: |
+          python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+          python3 -m venv "$RUNNER_TEMP/lint"
+          "$RUNNER_TEMP/lint/bin/pip" install --quiet \
+            shellcheck-py==0.11.0.1 actionlint-py==1.7.12.25 zizmor==1.31.1
+          echo "$RUNNER_TEMP/lint/bin" >> "$GITHUB_PATH"
+
+      - name: Unit tests
+        run: python3 test/run_suite.py
+
+      - name: Shellcheck
+        run: git ls-files -z -- '*.sh' | xargs -0 shellcheck
+
+      - name: actionlint
+        run: |
+          # actionlint 1.7.12 predates the concurrency `queue` key that the caller and the publish job use.
+          # The ignore covers that one message. The first run keeps discovering every workflow in
+          # .github/workflows; the second lints the caller template.
+          actionlint -ignore 'unexpected key "queue" for "concurrency" section'
+          actionlint -ignore 'unexpected key "queue" for "concurrency" section' templates/caller.yml
+
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor .github engine/setup/action.yml templates/caller.yml
+
+      - name: Docs - every command the docs name runs (F9)
+        run: bash test/docs.sh

@@ -1,0 +1,148 @@
+{
+  "schema": 1,
+  "note": "Kaggle serve candidates for T0. status 'unmeasured' means nothing was run and every number is null. status 'partial' means a real sysop serve session was timed (time_to_healthy_s, measured_on) but tok_s is null: spikes/kaggle_probe.py was not run (no key could be had without reading a credential file), so the speed is kept in tok_s_sysop with its provenance (sysop's models.json, dated 2026-10-06 in tok_s_measured_on). measured_on dates time_to_healthy_s only (2026-11-01). 'measured' needs every field. Do not fill a field from a guess. 'serve' holds the llama-server configuration the endpoint serves (slots, per-slot ctx, flags). The time_to_healthy_s figures were measured with sysop's 2 slots of 32768 config (SERVE_SLOTS 2, SERVE_CTX 32768) for all three models: the 35B is served with that config, and the 27B and gemma are served at 2 slots of 16384, a conservative pick with no run of its own. The tok_s_sysop figures were measured with sysop's 8 slots of 4096 throughput benchmark config, not with 'serve'. Each serve.source says which is which.",
+  "hardware": {
+    "gpus": "2x T4 (16 GB each)",
+    "source": "docs/engines.md Kaggle section; plan \u00a74.3"
+  },
+  "single_model_both_t4": [
+    {
+      "candidate": "A",
+      "family": "MoE, 35B total / 3B active",
+      "status": "partial",
+      "vendor": "alibaba",
+      "vendor_source": "plan \u00a74.1: kaggle/qwen... maps to alibaba",
+      "model": "unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "quant": "UD-Q4_K_M (from the file name)",
+      "context": null,
+      "vram_gb": null,
+      "tok_s": null,
+      "tok_s_sysop": 111.1,
+      "tok_s_source": "sysop reference scripts/kaggle/models.json tok_s (111.1), whose own source line reads 'sysop batch 2026-10-06: 2x T4, 8 parallel, 48x256 tokens of code, llama.cpp CUDA q8_0 KV'; measured by sysop on 2026-10-06, not by spikes/kaggle_probe.py and not re-measured on 2026-11-01",
+      "tok_s_measured_on": "2026-10-06",
+      "sysop_model_id": "qwen3.6-35b-a3b",
+      "time_to_healthy_s": 221,
+      "time_to_healthy_source": "ready_s printed by sysop serve up, measured by sysop serve (sysop.py serve up/list) on 2026-11-01, not by spikes/kaggle_probe.py",
+      "measured_on": "2026-11-01",
+      "notes": "context and VRAM not reported by sysop serve; left null. The plan's free-kaggle id qwen3.6-35b-a3b is served by sysop under this id.",
+      "serve": {
+        "slots": 2,
+        "ctx": 32768,
+        "flags": [
+          "-ngl",
+          "99",
+          "--split-mode",
+          "layer",
+          "--flash-attn",
+          "on",
+          "-ctk",
+          "q8_0",
+          "-ctv",
+          "q8_0"
+        ],
+        "source": "sysop reference scripts/kaggle/models.json entry qwen3.6-35b-a3b (flags unchanged from that entry: -ngl 99 --split-mode layer --flash-attn on -ctk q8_0 -ctv q8_0). time_to_healthy_s (221 s, 2026-11-01) was measured by sysop serve with this same config (SERVE_SLOTS 2, SERVE_CTX 32768): 2 x 32768 is the context sysop's agent jobs ran on this model with the same flags, so it is the measured agent context, not a guess. tok_s_sysop (111.1, 2026-10-06) was measured with the 8 slots of 4096 throughput benchmark config, which refuses any request over 4096 tokens (exceed_context_size_error); pi's own system prompt was measured at about 1600 tokens live on 2026-11-11, from pi's own request, and leaves no room for the task under 4096. So the tok/s of the served config is UNMEASURED in this repo. llama-server gets --parallel 2 and -c 65536, as in the reference scripts/kaggle/common.py."
+      }
+    },
+    {
+      "candidate": "B",
+      "family": "dense, 27B",
+      "status": "partial",
+      "vendor": "alibaba",
+      "vendor_source": "plan \u00a74.1: kaggle/qwen... maps to alibaba",
+      "model": "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "quant": "UD-Q4_K_M (from the file name)",
+      "context": null,
+      "vram_gb": null,
+      "tok_s": null,
+      "tok_s_sysop": 26.5,
+      "tok_s_source": "sysop reference scripts/kaggle/models.json tok_s (26.5), whose own source line reads 'sysop batch 2026-10-06: 2x T4, 8 parallel, 48x256 tokens of code, llama.cpp CUDA q8_0 KV (dense: slower, strongest)'; measured by sysop on 2026-10-06, not by spikes/kaggle_probe.py and not re-measured on 2026-11-01",
+      "tok_s_measured_on": "2026-10-06",
+      "sysop_model_id": "qwen3.8-27b",
+      "time_to_healthy_s": 169,
+      "time_to_healthy_source": "ready_s printed by sysop serve up, measured by sysop serve (sysop.py serve up/list) on 2026-11-01, not by spikes/kaggle_probe.py",
+      "measured_on": "2026-11-01",
+      "notes": "context and VRAM not reported by sysop serve; left null.",
+      "serve": {
+        "slots": 2,
+        "ctx": 16384,
+        "flags": [
+          "-ngl",
+          "99",
+          "--split-mode",
+          "layer",
+          "--flash-attn",
+          "on",
+          "-ctk",
+          "q8_0",
+          "-ctv",
+          "q8_0"
+        ],
+        "source": "sysop reference scripts/kaggle/models.json entry qwen3.8-27b (flags unchanged from that entry: -ngl 99 --split-mode layer --flash-attn on -ctk q8_0 -ctv q8_0). time_to_healthy_s (169 s, 2026-11-01) was measured by sysop serve with sysop's 2 slots of 32768 config (SERVE_SLOTS 2, SERVE_CTX 32768), not with the config served here. tok_s_sysop (26.5, 2026-10-06) was measured with the 8 slots of 4096 throughput benchmark config, which refuses any request over 4096 tokens (exceed_context_size_error); pi's own system prompt was measured at about 1600 tokens live on 2026-11-11, from pi's own request. The served config is 2 slots of 16384: 16384 per slot is a conservative pick (an agent needs room), sysop served this model at 2 x 32768, and the 2 x 16384 config has no run of its own. The time to healthy and tok/s of the served config are UNMEASURED in this repo. llama-server gets --parallel 2 and -c 32768, as in the reference scripts/kaggle/common.py."
+      }
+    },
+    {
+      "candidate": "C",
+      "family": "MoE, 26B total / 4B active",
+      "status": "partial",
+      "vendor": "google",
+      "vendor_source": "model repo owner is google",
+      "model": "google/gemma-4-26B-A4B-it-qat-q4_0-gguf/gemma-4-26B_q4_0-it.gguf",
+      "quant": "q4_0 QAT (from the file name)",
+      "context": null,
+      "vram_gb": null,
+      "tok_s": null,
+      "tok_s_sysop": 133.7,
+      "tok_s_source": "sysop reference scripts/kaggle/models.json tok_s (133.7), whose own source line reads 'spike 2, 2026-10-06: 2x T4, 8 parallel, 64x256 tokens, llama.cpp CUDA q8_0 KV'; measured by sysop on 2026-10-06, not by spikes/kaggle_probe.py and not re-measured on 2026-11-01",
+      "tok_s_measured_on": "2026-10-06",
+      "sysop_model_id": "gemma-4-26b-a4b",
+      "time_to_healthy_s": 138,
+      "time_to_healthy_source": "ready_s printed by sysop serve up, measured by sysop serve (sysop.py serve up/list) on 2026-11-01, not by spikes/kaggle_probe.py",
+      "measured_on": "2026-11-01",
+      "notes": "context and VRAM not reported by sysop serve; left null.",
+      "serve": {
+        "slots": 2,
+        "ctx": 16384,
+        "flags": [
+          "-ngl",
+          "99",
+          "--split-mode",
+          "layer",
+          "--flash-attn",
+          "on",
+          "-ctk",
+          "q8_0",
+          "-ctv",
+          "q8_0"
+        ],
+        "source": "sysop reference scripts/kaggle/models.json entry gemma-4-26b-a4b (flags unchanged from that entry: -ngl 99 --split-mode layer --flash-attn on -ctk q8_0 -ctv q8_0). time_to_healthy_s (138 s, 2026-11-01) was measured by sysop serve with sysop's 2 slots of 32768 config (SERVE_SLOTS 2, SERVE_CTX 32768), not with the config served here. tok_s_sysop (133.7, 2026-10-06) was measured with the 8 slots of 4096 throughput benchmark config, which refuses any request over 4096 tokens (exceed_context_size_error); pi's own system prompt was measured at about 1600 tokens live on 2026-11-11, from pi's own request. The served config is 2 slots of 16384: 16384 per slot is a conservative pick (an agent needs room), sysop served this model at 2 x 32768, and the 2 x 16384 config has no run of its own. The time to healthy and tok/s of the served config are UNMEASURED in this repo. llama-server gets --parallel 2 and -c 32768, as in the reference scripts/kaggle/common.py."
+      }
+    }
+  ],
+  "two_small_models": [
+    {
+      "candidate": "S",
+      "family": "two small models, one per T4 (two llama-server processes)",
+      "status": "unmeasured",
+      "vendor": null,
+      "vendor_source": null,
+      "models": [
+        {
+          "model": null,
+          "quant": null,
+          "context": null,
+          "vram_gb": null,
+          "tok_s": null
+        }
+      ],
+      "time_to_healthy_s": null,
+      "measured_on": null,
+      "notes": "not tested: sysop serve runs one model on both T4s and has no two-process mode; plan \u00a74.3 ships this variant only if T0 measures it as useful."
+    }
+  ],
+  "second_session": {
+    "status": "measured",
+    "measured_on": "2026-11-01",
+    "answer": "accepted: a second GPU kernel was pushed and ran to COMPLETE while the serve kernel was RUNNING",
+    "detail": "see docs/engines.md"
+  }
+}
