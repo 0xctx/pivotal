@@ -1,0 +1,916 @@
+# The reusable pipeline. ack, plan, models-up, build, review, assemble, gate, publish and report so far.
+name: factory
+
+on:
+  workflow_call:
+    # What templates/caller.yml passes. factory-untrusted passes only four of the secrets, so none is
+    # required here. An empty issue_pin means refuse: the factory checks the issue it reads against it.
+    inputs:
+      trusted:
+        type: boolean
+        required: true
+      kind:
+        type: string
+        required: true
+      issue:
+        type: string
+        required: true
+      issue_pin:
+        type: string
+        required: true
+      engine_sha:
+        # The release SHA the caller pins its `uses:` references at. A reusable workflow cannot read its own
+        # SHA from a context, so the caller passes it and piv init writes both from one value.
+        type: string
+        required: true
+      engine_repo:
+        # The engine repository to check out (the same OWNER/REPO as the caller's pinned `uses:` path). A reusable
+        # workflow cannot read its own repository, so the caller passes it and piv init writes it from one value.
+        type: string
+        required: true
+      preset:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      XAI_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      PIVOTAL_KAGGLE_URL:
+        required: false
+      PIVOTAL_KAGGLE_KEY:
+        required: false
+      KAGGLE_USERNAME:
+        required: false
+      KAGGLE_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  ack:
+    # Hears about every run: the comment, the building label and, for an incident or event, its issue.
+    # issues: write and no repo code: only the engine is checked out, and only gh runs (F1). The engine
+    # is checked out at the caller's pinned release SHA, the engine_sha input.
+    name: ack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    outputs:
+      # The runner the later jobs use, chosen by engine/where.py. ack itself always runs hosted,
+      # so an offline self-hosted runner can never keep the "waiting for your runner" comment from being posted.
+      runner: ${{ steps.where.outputs.runner }}
+      issue: ${{ steps.ack.outputs.issue }}
+      quiet: ${{ steps.ack.outputs.quiet }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Choose where the jobs run
+        id: where
+        env:
+          # Self-hosted only for PIVOTAL_RUNNER=self-hosted, a trusted run, and a private repo or trusted-only.
+          RUNNER_VAR: ${{ vars.PIVOTAL_RUNNER }}
+          RUNNER_PUBLIC: ${{ vars.PIVOTAL_RUNNER_PUBLIC }}
+          TRUSTED: ${{ inputs.trusted }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: python3 -I pivotal/engine/where.py
+      - name: Comment, label and open the incident
+        id: ack
+        env:
+          RUNNER: ${{ steps.where.outputs.runner }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KIND: ${{ inputs.kind }}
+          TRUSTED: ${{ inputs.trusted }}
+          ISSUE: ${{ inputs.issue }}
+          ISSUE_PIN: ${{ inputs.issue_pin }}
+          PRESET: ${{ inputs.preset }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}  # a line's own preset is the one the started comment names (R4)
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          LEVEL: ${{ vars.PIVOTAL_LEVEL }}
+          CHECK: ${{ vars.PIVOTAL_CHECK }}
+        run: python3 -I pivotal/engine/ack.py
+
+  plan:
+    # contents: read. It exits quietly unless the level allows the run, then runs the baseline on the base
+    # with a stripped environment and prints the one-slice matrix. timeout-minutes is derived from
+    # BASELINE_SECONDS in engine/plan.py (test_factory checks that they agree).
+    name: plan
+    needs: ack
+    # A quiet run needs no runner, so it stays hosted and never queues on (or holds the caller's group for) yours.
+    runs-on: ${{ needs.ack.outputs.quiet == 'true' && 'ubuntu-24.04' || needs.ack.outputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      base_sha: ${{ steps.baseline.outputs.base_sha }}
+      # The source of the agent-context files: the default branch, also in a fix round, whose base_sha is the previous round's draft head.
+      context_sha: ${{ steps.context.outputs.commit || steps.baseline.outputs.base_sha }}
+      baseline: ${{ steps.baseline.outputs.baseline || 'none' }}
+      matrix: ${{ steps.decide.outputs.matrix }}
+      round: ${{ steps.decide.outputs.round }}
+      issue_pin: ${{ steps.decide.outputs.issue_pin }}
+      # The one refusal that names itself (engine/plan.py ``plan_why``); empty on every run that got a matrix.
+      plan_why: ${{ steps.decide.outputs.plan_why }}
+      kaggle_needed: ${{ steps.decide.outputs.kaggle_needed }}
+      kaggle_model: ${{ steps.decide.outputs.kaggle_model }}
+      line: ${{ steps.decide.outputs.line }}
+      reviewer: ${{ steps.decide.outputs.reviewer }}
+      level: ${{ steps.decide.outputs.level }}
+      score: ${{ steps.decide.outputs.score }}
+      target: ${{ steps.decide.outputs.target }}
+      scores: ${{ steps.decide.outputs.scores }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Decide the level, the round and the slice
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KIND: ${{ inputs.kind }}
+          TRUSTED: ${{ inputs.trusted }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          ISSUE_PIN: ${{ inputs.issue_pin }}
+          PRESET: ${{ inputs.preset }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}
+          LEVEL: ${{ vars.PIVOTAL_LEVEL }}
+          CHECK: ${{ vars.PIVOTAL_CHECK }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: python3 -I pivotal/engine/plan.py decide
+      - name: Check out the base
+        id: repo
+        if: steps.decide.outputs.matrix != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A fix round (F8) takes the draft's head as its base: plan checked the branch is still there. Any other run, the default branch.
+          ref: ${{ steps.decide.outputs.base_ref || github.event.repository.default_branch }}
+          path: repo
+          persist-credentials: false
+      - name: Check out the default branch, the trusted source of the agent-context files of a fix round
+        id: context
+        if: steps.decide.outputs.base_ref != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: context
+          persist-credentials: false
+      - name: Run the baseline
+        id: baseline
+        if: steps.decide.outputs.matrix != ''
+        # No token here: this step runs the repo's own commands, through run_gate with a stripped environment.
+        env:
+          BASE_SHA: ${{ steps.repo.outputs.commit }}
+          BASE_REF: ${{ steps.decide.outputs.base_ref }}
+          REPO_DIR: ${{ github.workspace }}/repo
+          LOG: ${{ runner.temp }}/baseline.log
+          SETUP: ${{ vars.PIVOTAL_SETUP }}
+          CHECK: ${{ vars.PIVOTAL_CHECK }}
+          LEVEL: ${{ vars.PIVOTAL_LEVEL }}
+        run: python3 -I pivotal/engine/plan.py baseline
+
+  models-up:
+    # One Kaggle serving session for every repo. Runs only when the routed chain holds a pi:kaggle/* entry. No GitHub
+    # permission beyond reading the engine, no GitHub token in any step, no model output and no repo code: only the engine
+    # (a pinned release) and the kaggle CLI run. Its secrets are the Kaggle account and the endpoint, on the one step that
+    # needs them; engine/modelsup.py is exec'd (non-dumpable, env emptied) and hands the kaggle CLI the account only. An
+    # untrusted run is given no Kaggle account by the caller (F2b), so it can only reuse a live session. The job always
+    # ends with a kaggle_ok output and never fails the pipeline for a session that did not come up: the builds fall through
+    # visibly. timeout-minutes is derived from the budgets in engine/modelsup.py (test_factory checks that they agree).
+    name: models-up
+    needs: [ack, plan]
+    if: "!cancelled() && needs.plan.result == 'success' && needs.plan.outputs.kaggle_needed == 'true'"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    permissions:
+      contents: read
+    outputs:
+      kaggle_ok: ${{ steps.up.outputs.kaggle_ok || 'false' }}
+      kaggle_why: ${{ steps.up.outputs.kaggle_why }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Install the Kaggle CLI
+        # No secret here. The version is the one docs/engines.md measured; its dependencies are not pinned (accepted), except six, which kaggle imports without declaring (measured live: the CLI crashed at import in a clean venv).
+        run: |
+          python3 -m venv "$RUNNER_TEMP/kaggle-venv"
+          "$RUNNER_TEMP/kaggle-venv/bin/pip" install --disable-pip-version-check --no-input kaggle==2.2.4 six==1.17.0
+      - name: Reuse, wait for or start the Kaggle session
+        id: up
+        env:
+          PIVOTAL_KAGGLE_URL: ${{ secrets.PIVOTAL_KAGGLE_URL }}
+          PIVOTAL_KAGGLE_KEY: ${{ secrets.PIVOTAL_KAGGLE_KEY }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_MODEL: ${{ needs.plan.outputs.kaggle_model }}
+          # Off unless the repo sets it to 1: the live check of docs/engines.md (every route but /health must be a 401).
+          PIVOTAL_KEYLESS_CHECK: ${{ vars.PIVOTAL_KEYLESS_CHECK }}
+          PIV_KAGGLE: ${{ runner.temp }}/kaggle-venv/bin/kaggle
+        # exec: the Python process IS the step process, so no bash parent keeps the secrets in its environment.
+        run: exec python3 -I pivotal/engine/modelsup.py
+
+  build:
+    # One job per slice. contents: read, no GitHub token in any step and no persisted credential (F1). The only
+    # secrets are the door secrets on the one step that runs the agent; engine/run.sh hands the agent just its
+    # own, and strips them all from setup and check (F3). Untrusted text (the slice, the findings) reaches the
+    # engine through env and files (F2). timeout-minutes is derived from the budgets in engine/buildjob.py
+    # (test_factory checks that they agree). It waits for models-up, which is skipped when no Kaggle entry is routed, and
+    # runs whatever models-up's result: each build re-checks the endpoint itself when it starts.
+    name: build ${{ matrix.slice.id }}
+    needs: [ack, plan, models-up]
+    if: "!cancelled() && needs.plan.result == 'success' && needs.models-up.result != 'cancelled' && needs.plan.outputs.matrix != ''"
+    runs-on: ${{ needs.ack.outputs.runner }}
+    timeout-minutes: 157
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Check the slice and name the commit to build on
+        id: prepare
+        # No secret here. A fix round builds on its head_sha, any other run on the plan's base_sha.
+        env:
+          SLICE: ${{ toJSON(matrix.slice) }}
+          ROUND: ${{ needs.plan.outputs.round }}
+          SCORE: ${{ needs.plan.outputs.score }}
+          TARGET: ${{ needs.plan.outputs.target }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+        run: python3 -I pivotal/engine/buildjob.py prepare
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.prepare.outputs.ref }}
+          path: repo
+          persist-credentials: false
+      - name: Check out the base, the source of the agent-context files
+        # The default branch, also in a fix round: the build restores its agent-context files before the agent starts (R15).
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.context_sha }}
+          path: base
+          persist-credentials: false
+      - name: Install the pinned worker CLIs
+        id: setup
+        # No secret here: the step runs engine/setup/install.py (a composite action of the pinned engine), which installs the
+        # CLIs the preset's build and review tiers name, each at its pinned version, with --ignore-scripts. A CLI that cannot be
+        # installed is a visible `not installed` fall-through, never a missing binary. Its manifest is read before any agent starts.
+        # Local on purpose: the engine checkout at the caller's engine_sha is the pin. zizmor's `$/` form would resolve to
+        # the workflow's own ref, which is not pinned.
+        uses: ./pivotal/engine/setup  # zizmor: ignore[self-repository]
+        env:
+          PRESET: ${{ inputs.preset }}
+          LINE: ${{ needs.plan.outputs.line }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}
+      # The re-check of a Kaggle endpoint is engine/buildjob.py recheck_endpoint (one probe with the key), called when the
+      # step below routes the build tier: a session that ended while this job waited for a runner falls through visibly.
+      - name: Build the slice
+        id: build
+        env:
+          SLICE: ${{ toJSON(matrix.slice) }}
+          ROUND: ${{ needs.plan.outputs.round }}
+          SCORE: ${{ needs.plan.outputs.score }}
+          TARGET: ${{ needs.plan.outputs.target }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          PRESET: ${{ inputs.preset }}
+          LINE: ${{ needs.plan.outputs.line }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}
+          SETUP: ${{ vars.PIVOTAL_SETUP }}
+          CHECK: ${{ vars.PIVOTAL_CHECK }}
+          REPO_DIR: ${{ github.workspace }}/repo
+          BASE_DIR: ${{ github.workspace }}/base
+          WORK_DIR: ${{ runner.temp }}/slice
+          ENGINE_DIR: ${{ github.workspace }}/pivotal
+          PIVOTAL_WORKERS: ${{ runner.temp }}/pivotal-workers.json  # the installed CLIs' manifest (engine/workers.py)
+          # Hosted: one job per fresh machine, so every process of the job user is the job's. Self-hosted: pv-runner
+          # services share a user, so contain only what is below the build step (docs/RUNNER.md).
+          CONTAIN_SCOPE: ${{ needs.ack.outputs.runner == 'self-hosted' && 'descendants' || 'user' }}
+          PIVOTAL_CONTAIN_USER_OK: ${{ needs.ack.outputs.runner == 'self-hosted' && '0' || '1' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PIVOTAL_KAGGLE_URL: ${{ secrets.PIVOTAL_KAGGLE_URL }}
+          PIVOTAL_KAGGLE_KEY: ${{ secrets.PIVOTAL_KAGGLE_KEY }}
+          KAGGLE_WHY: ${{ needs.models-up.outputs.kaggle_why }}  # a refused push skips the kaggle entries as quota
+        # exec: the Python process IS the step process, so no bash parent keeps the secrets in its environment.
+        run: exec python3 -I pivotal/engine/buildjob.py run
+      - name: Upload the slice artifact
+        # The artifact directory holds result.json, the patch of an ok build and the redacted summary. The raw
+        # agent log is in a sibling directory that is never uploaded. The engine writes `published=true` only after
+        # it made exactly those files, with no stray process alive, and exits 0 only then. Both are required: an
+        # agent can append the output line itself and can kill the engine, which leaves the outcome `failure`.
+        # Anything else uploads nothing, and assemble reads the missing artifact as a failed slice (F5).
+        if: steps.build.outcome == 'success' && steps.build.outputs.published == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slice-${{ matrix.slice.id }}
+          path: ${{ runner.temp }}/slice/out
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+      - name: Fail the job if the slice build failed
+        # The build step exits 0 after it published, even for a failed build. The decision is the engine's own
+        # `build_ok` output, written by the non-dumpable process after it verified every engine file: no engine
+        # code runs from the checkout after the agent, so there is nothing here the agent could have edited. A
+        # killed engine leaves the build step `failure`, which already fails the job.
+        if: steps.build.outcome == 'success' && steps.build.outputs.build_ok != 'true'
+        run: |
+          echo "::error::the slice build failed; the artifact slice-${SLICE_ID} has the reason in result.json"
+          exit 1
+        env:
+          SLICE_ID: ${{ matrix.slice.id }}
+
+  review:
+    # One job per slice, on a fresh VM, after build. contents: read, no GitHub token in any step and no persisted
+    # credential (F1). The patch is hostile data: the engine applies it with hardened git, restores the agent-context files
+    # from the base checkout and runs a different vendor's read-only review (engine/reviewjob.py). The only secrets are the
+    # door secrets on the one step that runs the agent; the engine hands the agent just its own. Untrusted text reaches the
+    # engine through env and files (F2). timeout-minutes is derived from the budgets in engine/reviewjob.py (test_factory
+    # checks that they agree). A missing build artifact fails the download step, which is a missing review (F5).
+    name: review ${{ matrix.slice.id }}
+    needs: [ack, plan, models-up, build]
+    if: "!cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != ''"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 92
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Check the slice and name the commit the patch applies to
+        id: prepare
+        # No secret here. The same commit the build job built on: base_sha, or a fix round's head_sha.
+        env:
+          SLICE: ${{ toJSON(matrix.slice) }}
+          ROUND: ${{ needs.plan.outputs.round }}
+          # No score command runs here: buildjob.read_round takes a score run's fix-round bound from SCORE (a second fix round is refused without it).
+          SCORE: ${{ needs.plan.outputs.score }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+        run: python3 -I pivotal/engine/reviewjob.py prepare
+      - name: Check out the commit the patch applies to
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.prepare.outputs.ref }}
+          path: repo
+          persist-credentials: false
+      - name: Check out the base, the source of the agent-context files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.context_sha }}
+          path: base
+          persist-credentials: false
+      - name: Install the pinned worker CLIs
+        id: setup
+        # No secret here: the step runs engine/setup/install.py (a composite action of the pinned engine), which installs the
+        # CLIs the preset's build and review tiers name, each at its pinned version, with --ignore-scripts. A CLI that cannot be
+        # installed is a visible `not installed` fall-through, never a missing binary. Its manifest is read before any agent starts.
+        # Local on purpose: the engine checkout at the caller's engine_sha is the pin. zizmor's `$/` form would resolve to
+        # the workflow's own ref, which is not pinned.
+        uses: ./pivotal/engine/setup  # zizmor: ignore[self-repository]
+        env:
+          PRESET: ${{ inputs.preset }}
+          LINE: ${{ needs.plan.outputs.line }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}
+      - name: Download the slice artifact
+        # Untrusted input: the engine reads it as regular files of known names and a checked result.json.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: slice-${{ matrix.slice.id }}
+          path: ${{ runner.temp }}/slice-in
+      - name: Review the slice
+        id: review
+        env:
+          SLICE: ${{ toJSON(matrix.slice) }}
+          ROUND: ${{ needs.plan.outputs.round }}
+          # No score command runs here: buildjob.read_round takes a score run's fix-round bound from SCORE (a second fix round is refused without it).
+          SCORE: ${{ needs.plan.outputs.score }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          PRESET: ${{ inputs.preset }}
+          LINE: ${{ needs.plan.outputs.line }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}
+          REPO_DIR: ${{ github.workspace }}/repo
+          BASE_DIR: ${{ github.workspace }}/base
+          SLICE_DIR: ${{ runner.temp }}/slice-in
+          WORK_DIR: ${{ runner.temp }}/review
+          ENGINE_DIR: ${{ github.workspace }}/pivotal
+          PIVOTAL_WORKERS: ${{ runner.temp }}/pivotal-workers.json  # the installed CLIs' manifest (engine/workers.py)
+          CONTAIN_SCOPE: user
+          PIVOTAL_CONTAIN_USER_OK: "1"  # hosted runner: one job per fresh machine
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PIVOTAL_KAGGLE_URL: ${{ secrets.PIVOTAL_KAGGLE_URL }}
+          PIVOTAL_KAGGLE_KEY: ${{ secrets.PIVOTAL_KAGGLE_KEY }}
+          KAGGLE_WHY: ${{ needs.models-up.outputs.kaggle_why }}  # a refused push skips the kaggle entries as quota
+        # exec: the Python process IS the step process, so no bash parent keeps the secrets in its environment.
+        run: exec python3 -I pivotal/engine/reviewjob.py run
+      - name: Upload the review artifact
+        # The artifact directory holds verdict, review.md and reviewed_by, made by the engine from bytes. Both conditions
+        # are required, as in build: an agent can append the output line itself and can kill the engine, which leaves the
+        # outcome `failure`. Anything else uploads nothing, and assemble reads the missing artifact as a missing verdict (F5).
+        if: steps.review.outcome == 'success' && steps.review.outputs.published == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: review-${{ matrix.slice.id }}
+          path: ${{ runner.temp }}/review/out
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+      - name: Fail the job if there is no valid verdict
+        # The engine's own `review_ok` decides (true only for READY or NEEDS FIXES), as build_ok does for build: no engine
+        # code runs from the checkout after the agent. A killed engine leaves the review step `failure`, which already
+        # fails the job. The artifact is uploaded either way, so assemble can read the reason.
+        if: steps.review.outcome == 'success' && steps.review.outputs.review_ok != 'true'
+        run: |
+          echo "::error::the review of slice ${SLICE_ID} has no valid verdict; the artifact review-${SLICE_ID} has the reason"
+          exit 1
+        env:
+          SLICE_ID: ${{ matrix.slice.id }}
+  assemble:
+    # contents: read and no token in any step. It runs no repo code: the repo is checked out only so git can fetch the
+    # base commit's objects from it, and the only program the engine starts is /usr/bin/git, on a scratch repository
+    # with a clean configuration and no hooks (engine/assemble.py). The slice artifacts are hostile input: the engine
+    # opens each without following links, caps every size and validates result.json before it uses anything (F5).
+    # `!cancelled()` so it also runs when a build or a review failed: a slice with no artifact is a failed slice in
+    # land.json and one with no `review-<id>` artifact is a draft (no verdict). The review artifacts are hostile input too
+    # (engine/review.py `load`). Nothing writes to GitHub here; the publish job reads the `land` artifact.
+    name: assemble
+    needs: [ack, plan, build, review]
+    if: "!cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != ''"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      positions: ${{ steps.assemble.outputs.positions }}
+      gate_matrix: ${{ steps.assemble.outputs.gate_matrix }}
+      has_stack: ${{ steps.assemble.outputs.has_stack }}
+      land_sha256: ${{ steps.assemble.outputs.land_sha256 }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Check out the base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.base_sha }}
+          path: repo
+          persist-credentials: false
+      - name: Make the artifact directories
+        # The download steps create nothing when no build or review published, and the engine wants the directories.
+        env:
+          SLICES_DIR: ${{ runner.temp }}/slices
+          REVIEWS_DIR: ${{ runner.temp }}/reviews
+        run: mkdir -p -- "$SLICES_DIR" "$REVIEWS_DIR"
+      - name: Download the slice artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: slice-*
+          path: ${{ runner.temp }}/slices
+      - name: Download the review artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: review-*
+          path: ${{ runner.temp }}/reviews
+      - name: Classify the slices and make the draft branches
+        id: assemble
+        env:
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          BASELINE: ${{ needs.plan.outputs.baseline }}
+          KIND: ${{ inputs.kind }}
+          REPO_DIR: ${{ github.workspace }}/repo
+          SLICES_DIR: ${{ runner.temp }}/slices
+          REVIEWS_DIR: ${{ runner.temp }}/reviews
+          OUT_DIR: ${{ runner.temp }}/land
+          WORK_DIR: ${{ runner.temp }}/assemble-work
+        run: python3 -I pivotal/engine/assemble.py run
+      - name: Upload land.json and the bundle
+        # Only the engine's output directory goes up: land.json, and pivotal.bundle when a draft exists.
+        if: steps.assemble.outputs.assembled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: land
+          path: ${{ runner.temp }}/land
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+
+  gate:
+    # One job per slice on the stack (assemble's `positions`), each on a fresh VM (F4, `gate[k]`): check out the stack
+    # at that slice's head, run the repo's own check on exactly that commit and say whether it is green, whether HEAD is
+    # unchanged and whether the tree is clean. This job RUNS REPO CODE, so it is contents: read with no GitHub token, no
+    # subscription secret and no secret of any kind in any step, and no persisted credential (F1, F3). The `land` artifact
+    # is hostile input: the engine binds land.json to the assemble job by `land_sha256`, validates it and the bundle, and
+    # takes the commit only from them (engine/gatejob.py). The matrix is assemble's gate_matrix (a JSON array of slice ids, validated
+    # by job.OUTPUT_RULES) and the engine checks each id again against land.json. timeout-minutes is derived from the budget in
+    # engine/gatejob.py (test_factory checks that they agree). The artifact gate-<id> holds gate.json (engine/gate.py); a
+    # missing one is a gate that did not happen, never a green (F5). `!cancelled()` so a failed gate does not hide the others.
+    name: gate ${{ matrix.id }}
+    needs: [ack, plan, assemble]
+    if: "!cancelled() && needs.assemble.result == 'success' && needs.assemble.outputs.has_stack == 'true'"
+    runs-on: ${{ needs.ack.outputs.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        id: ${{ fromJSON(needs.assemble.outputs.gate_matrix) }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Check out the base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.base_sha }}
+          path: repo
+          persist-credentials: false
+      - name: Download the land artifact
+        # Untrusted input: land.json and the bundle, checked by the engine against the assemble job's land_sha256.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: land
+          path: ${{ runner.temp }}/land
+      - name: Check out the stack commit
+        id: prepare
+        # No secret here and no repo code: the engine fetches the stack from the bundle with hardened git and checks out
+        # the head of this prefix, then proves the checkout is that commit and clean.
+        env:
+          ID: ${{ matrix.id }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          LAND_SHA256: ${{ needs.assemble.outputs.land_sha256 }}
+          LAND_DIR: ${{ runner.temp }}/land
+          REPO_DIR: ${{ github.workspace }}/repo
+          WORK_DIR: ${{ runner.temp }}/gate
+        run: python3 -I pivotal/engine/gatejob.py prepare
+      - name: Run the gate
+        id: gate
+        env:
+          ID: ${{ matrix.id }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          LAND_SHA256: ${{ needs.assemble.outputs.land_sha256 }}
+          LAND_DIR: ${{ runner.temp }}/land
+          LINE: ${{ needs.plan.outputs.line }}
+          PRESET_JSON: ${{ vars.PIVOTAL_PRESET_JSON }}
+          SETUP: ${{ vars.PIVOTAL_SETUP }}
+          CHECK: ${{ vars.PIVOTAL_CHECK }}
+          SCORE: ${{ needs.plan.outputs.score }}
+          TARGET: ${{ needs.plan.outputs.target }}
+          REPO_DIR: ${{ github.workspace }}/repo
+          WORK_DIR: ${{ runner.temp }}/gate
+          ENGINE_DIR: ${{ github.workspace }}/pivotal
+          # Hosted: one job per fresh machine, so every process of the job user is the job's. Self-hosted: pv-runner
+          # services share a user, so contain only what is below the engine (docs/RUNNER.md).
+          CONTAIN_SCOPE: ${{ needs.ack.outputs.runner == 'self-hosted' && 'descendants' || 'user' }}
+          PIVOTAL_CONTAIN_USER_OK: ${{ needs.ack.outputs.runner == 'self-hosted' && '0' || '1' }}
+        # exec: the Python process IS the step process (non-dumpable), so the check cannot read or write the engine's memory.
+        run: exec python3 -I pivotal/engine/gatejob.py run
+      - name: Upload the gate artifact
+        # The artifact directory holds gate.json only, made by the engine from facts it read with git after the check. The
+        # engine writes `published=true` only after it made exactly that file, with no stray process alive. Both conditions
+        # are required, as in build: a check can append the output line itself and can kill the engine, which leaves the
+        # outcome `failure`. Anything else uploads nothing, and publish reads the missing artifact as not landable (F5).
+        if: steps.gate.outcome == 'success' && steps.gate.outputs.published == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-${{ matrix.id }}
+          path: ${{ runner.temp }}/gate/out
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+      - name: Fail the job if the gate is not green
+        # The engine's own `gate_ok` decides (true only for a green gate: the check passed, HEAD unchanged, tree clean),
+        # written by the non-dumpable process after it verified every engine file. A killed engine leaves the gate step
+        # `failure`, which already fails the job.
+        if: steps.gate.outcome == 'success' && steps.gate.outputs.gate_ok != 'true'
+        run: |
+          echo "::error::the gate of slice ${GATE_ID} is not green; the artifact gate-${GATE_ID} has the facts"
+          exit 1
+        env:
+          GATE_ID: ${{ matrix.id }}
+
+  publish:
+    # The one job with a GitHub write token (F1): contents (to move the base by a plain fast-forward and push the stack and draft
+    # branches), pull-requests (to open the stack and draft pull requests) and checks (to create the `pivotal/gate` seal). It
+    # runs only git and gh on the `land`, `gate-*`, `review-*` and `slice-*` artifacts, all hostile input, never repo code or
+    # model output; the repo is not checked out. The engine compares the sha256 of land.json with assemble's `land_sha256`
+    # OUTPUT before it trusts the artifact, checks every branch it fetched from the bundle, and computes the landable prefix
+    # from the artifacts itself (engine/publish.py, F4). It lands only for a trusted run at the land level, by a push that is
+    # never forced; a push GitHub refuses becomes a ready stack pull request. `!cancelled()` and a successful assemble: a
+    # cancelled run never publishes (F6). The gate job FAILS when one slice's gate is red, and the green prefix before it is
+    # still landable, so a `failure` of the gate is accepted here (the artifacts decide); it is `skipped` exactly when assemble
+    # stacked nothing, and the engine refuses a skipped gate beside a stack. The review job's result is passed on: anything but
+    # `success` leaves no landable prefix, though the drafts are still published. One publish per repo at a time and none
+    # dropped: `queue: max` (actionlint 1.7.12 predates the key; ci.yml ignores that one message for this file and the caller).
+    # Re-runs never duplicate a PR: the pull requests are looked up by branch. `result` is the line report.py reads.
+    name: publish
+    needs: [ack, plan, review, assemble, gate]
+    if: >-
+      !cancelled() && needs.assemble.result == 'success' &&
+      (needs.gate.result == 'success' || needs.gate.result == 'failure' ||
+      (needs.gate.result == 'skipped' && needs.assemble.outputs.has_stack == 'false'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: pivotal-publish-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    outputs:
+      result: ${{ steps.publish.outputs.result }}
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Make the artifact directories
+        # The download steps create nothing when no gate, review or build published, and the engine wants the directories.
+        env:
+          GATES_DIR: ${{ runner.temp }}/gates-in
+          REVIEWS_DIR: ${{ runner.temp }}/reviews-in
+          SLICES_DIR: ${{ runner.temp }}/slices-in
+        run: mkdir -p -- "$GATES_DIR" "$REVIEWS_DIR" "$SLICES_DIR"
+      - name: Download land.json and the bundle
+        # Untrusted input: the engine hashes land.json against the assemble job's output before it reads anything else.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: land
+          path: ${{ runner.temp }}/land-in
+      - name: Download the gate artifacts
+        # Untrusted input: gate.json of each slice, written in a job that ran repo code; validated by engine/gate.py.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: gate-*
+          path: ${{ runner.temp }}/gates-in
+      - name: Download the review artifacts
+        # Untrusted input: validated and re-parsed by engine/review.py `load`, then bound to the patch and the files.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: review-*
+          path: ${{ runner.temp }}/reviews-in
+      - name: Download the slice artifacts
+        # Untrusted input: the engine reads result.json and slice.patch only to bind the review to the patch it judged.
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: slice-*
+          path: ${{ runner.temp }}/slices-in
+      - name: Land the prefix or open the pull requests, then seal
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ needs.ack.outputs.issue }}
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+          ROUND: ${{ needs.plan.outputs.round }}
+          TARGET: ${{ needs.plan.outputs.target }}
+          SCORES: ${{ needs.plan.outputs.scores }}
+          ISSUE_PIN: ${{ needs.plan.outputs.issue_pin }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          HAS_STACK: ${{ needs.assemble.outputs.has_stack }}
+          LAND_SHA256: ${{ needs.assemble.outputs.land_sha256 }}
+          KIND: ${{ inputs.kind }}
+          TRUSTED: ${{ inputs.trusted }}
+          LEVEL: ${{ vars.PIVOTAL_LEVEL }}
+          REVIEWER: ${{ needs.plan.outputs.reviewer }}
+          PLANNED_LEVEL: ${{ needs.plan.outputs.level }}
+          CHECK: ${{ vars.PIVOTAL_CHECK }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          LAND_DIR: ${{ runner.temp }}/land-in
+          GATES_DIR: ${{ runner.temp }}/gates-in
+          REVIEWS_DIR: ${{ runner.temp }}/reviews-in
+          SLICES_DIR: ${{ runner.temp }}/slices-in
+          WORK_DIR: ${{ runner.temp }}/publish-work
+        # exec: the Python process IS the step process, so no bash parent keeps the token in its environment.
+        run: exec python3 -I pivotal/engine/publish.py run
+
+  report:
+    # Hears about every run (F7): one comment, one ntfy message, the status labels and the step summary, red when
+    # anything failed. issues: write and no repo code: only the engine is checked out, and only gh and curl run.
+    # The only secret-like value is the ntfy topic variable. `if: always()` runs it after a failed or cancelled
+    # job too; engine/report.py is quiet when ack says so (its `quiet` output), as ack and plan are.
+    # A run that trust refused never reaches this workflow. ACK_RESULT and PLAN_RESULT are the upstream results, and
+    # PLAN_WHY is plan's `plan_why` output: the one refusal word of that job (engine/report.py PLAN_WHY), so a run
+    # refused for its size names itself instead of reading as plan_failed.
+    # RESULT (one line of JSON, see engine/report.py) is wired to the last pipeline job's output when it exists,
+    # and until then its absence is `failed (no_result)`. Add each new job to `needs`, with a `<JOB>_RESULT` env
+    # entry set to that job's `result` as it lands (test_factory fails until you do).
+    # When ack or plan did not succeed, report never reads the issue: it names `issue #N` and fixed text only.
+    # Always hosted, but it needs plan: with the self-hosted runner offline, plan waits for it and so does report.
+    # The "waiting for your runner" comment is ack's, posted before anything queues.
+    name: report
+    needs: [ack, plan, models-up, build, review, assemble, gate, publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Name the pinned engine
+        id: engine
+        env:
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          # Fail closed: an engine at no SHA would be the default branch, and the all-zero SHA is the
+          # placeholder of an unedited caller.
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ && "$ENGINE_SHA" != "0000000000000000000000000000000000000000" ]] ||
+            { echo "engine_sha is not a release commit SHA" >&2; exit 1; }
+          echo "sha=$ENGINE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out the engine at the pinned release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.engine_repo }}
+          ref: ${{ steps.engine.outputs.sha }}
+          path: pivotal
+          persist-credentials: false
+      - name: Comment, label, notify and summarise
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          KIND: ${{ inputs.kind }}
+          TRUSTED: ${{ inputs.trusted }}
+          ISSUE: ${{ needs.ack.outputs.issue || inputs.issue }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          QUIET: ${{ needs.ack.outputs.quiet }}
+          ACK_RESULT: ${{ needs.ack.result }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          PLAN_WHY: ${{ needs.plan.outputs.plan_why }}
+          MODELS_UP_RESULT: ${{ needs.models-up.result }}
+          KAGGLE_WHY: ${{ needs.models-up.outputs.kaggle_why }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          HAS_STACK: ${{ needs.assemble.outputs.has_stack }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RESULT: ${{ needs.publish.outputs.result }}
+          PIVOTAL_NTFY: ${{ vars.PIVOTAL_NTFY }}
+        run: python3 -I pivotal/engine/report.py post
+

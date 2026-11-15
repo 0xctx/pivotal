@@ -1,0 +1,7 @@
+{
+  "name": "mirror",
+  "summary": "A hill-climb toward an attached mockup: build, screenshot, score similarity, iterate.",
+  "prompt": "mirror.md",
+  "gate": "standard",
+  "score": {"scorer": "image", "target": 0.95, "max_rounds": 5}
+}

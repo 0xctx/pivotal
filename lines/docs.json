@@ -1,0 +1,6 @@
+{
+  "name": "docs",
+  "summary": "Prose changes. The gate is the repo's check, then links, fences and spelling.",
+  "prompt": "docs.md",
+  "gate": "docs"
+}

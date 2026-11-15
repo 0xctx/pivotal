@@ -1,0 +1,2 @@
+# Every ticket appends to the changelog; keep both sides when branches merge.
+CHANGELOG.md merge=union

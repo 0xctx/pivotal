@@ -1,0 +1,15 @@
+# Composite action: install the pinned worker CLIs that a job's build and review tiers name.
+# The action is the engine's own checkout at the caller's pinned release (`uses: ./pivotal/engine/setup`). It holds no
+# secret: the step gets only the preset's names, and install.py runs npm and the CLIs with a bare environment.
+# engine/setup/install.py is the one implementation; pins.json holds the versions. docs/engines.md records what was measured.
+name: pivotal-setup
+description: Install the pinned worker CLIs that a preset's build and review tiers name.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the pinned worker CLIs
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+      run: python3 -I "$ACTION_DIR/install.py"
