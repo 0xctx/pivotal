@@ -33,9 +33,13 @@ piv init you/app-two --check 'python3 -m pytest' --preset free-kaggle
 piv doctor --all
 piv now --owner you
 piv digest --owner you --since 24
+piv upgrade --owner you
 ```
 
-`piv digest` lists red mains, ready PRs and watchdog flags (15 minutes); `--json` emits JSON for a script.
+`piv digest` lists red mains, ready PRs and watchdog flags (15 minutes); `--json` emits JSON for a script. When the engine
+has a new release, `piv upgrade` moves every caller at once and prints one line per repo: `current`,
+`updated <old sha12> -> <new sha12>` or `refused: <why>`; `--release v1.1` names the tag or commit instead of the latest
+release, and a caller that pins a fork keeps its fork.
 
 ### 3. A performance hill-climb
 

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -928,6 +929,110 @@ class PrepareSealTest(ScenarioCase):
                 self.assertIn(refusal, land.job("land").step("land").log)
                 self.assertEqual(base_of(sb), before, "nothing moved")
                 self.assertEqual(sb.hub.issue(7).get("state", "open"), "open")
+
+
+def regate_event(sb: Sandbox, issue: int, pin: str, branch: str, sealed: str, base: str) -> tuple[str, dict]:
+    """A pivotal-regate repository_dispatch as the land job sends it, and as GitHub would deliver it: the type names the action,
+    the sender is the repository's own token."""
+    return "repository_dispatch", {
+        "action": "pivotal-regate", "sender": {"login": "github-actions[bot]", "type": "Bot"},
+        "repository": {"full_name": REPO},
+        "client_payload": {"issue": issue, "pin": pin, "branch": branch, "sealed_sha": sealed, "base_sha": base},
+    }
+
+
+def move_main(sb: Sandbox, name: str = "other.txt", text: str = "somebody else's work\n") -> str:
+    """A commit on the base after the stack was sealed, pushed as another person's merge would leave it. Returns its sha."""
+    seed = sb.root / "seed-main"
+    shutil.rmtree(seed, ignore_errors=True)
+    sb.git("clone", "-q", str(sb.origin), str(seed))
+    sb.git("checkout", "-q", "main", cwd=seed)
+    (seed / name).write_text(text)
+    sb.git("add", "-A", cwd=seed)
+    sb.git("commit", "-q", "-m", "an unrelated change", cwd=seed)
+    tip = sb.git("rev-parse", "HEAD", cwd=seed)
+    sb.git("push", "-q", str(sb.origin), "main", cwd=seed)
+    shutil.rmtree(seed, ignore_errors=True)
+    return tip
+
+
+class MovedBaseRegateTest(ScenarioCase):
+    """The base moves after the stack was sealed: the land job pushes nothing, sends a pivotal-regate dispatch of the issue,
+    the pin the run was trusted on, the issue's stack branch, the sealed sha and the base it was gated on, and ends red.
+    The run GitHub makes from that dispatch starts no work: the replay of the stack is the next slice (land-regate-replay)."""
+
+    def sealed_stack(self) -> tuple[Sandbox, Run, dict, str]:
+        sb = self.sandbox()
+        sb.set_agents(verdict="READY")
+        base = base_of(sb)
+        run = self.pipeline(sb)
+        self.assertEqual(run.result("publish"), "success")
+        (pr,) = sb.hub.prs()
+        self.assertEqual((pr["headRefName"], pr["isDraft"], pr["state"]), ("pivotal/issue-7/stack", False, "OPEN"))
+        self.assertEqual(base_of(sb), base, "prepare moves no base")
+        (sealed,) = [c["head_sha"] for c in seals(sb)]
+        self.assertEqual(sealed, pr["headRefOid"])
+        return sb, run, pr, sealed
+
+    def test_a_moved_base_sends_a_regate_dispatch_and_the_land_job_stays_red(self):
+        sb, run, pr, sealed = self.sealed_stack()
+        moved = move_main(sb)
+        land = sb.run_workflow(pr_comment_event(sb, pr["number"], "/pivotal land", "alice"))
+        log = land.job("land").step("land").log
+        self.assertEqual(land.result("land"), "failure", log)
+        self.assertEqual(base_of(sb), moved, "nothing was pushed: the base is where it moved to")
+        self.assertEqual(sb.hub.issue(7).get("state", "open"), "open", "the issue stays open")
+        self.assertIn("re-gate dispatched", log)
+        (sent,) = sb.hub.state()["dispatches"]
+        self.assertEqual(sent["event_type"], "pivotal-regate")
+        self.assertEqual(sent["client_payload"], {"issue": 7, "pin": run.inputs["issue_pin"],
+                                                  "branch": "pivotal/issue-7/stack", "sealed_sha": sealed, "base_sha": sb.base_sha})
+        self.assertNotIn("Landed", "\n".join(sb.hub.comments(7)), "the comment never claims a landing")
+        self.assertIn("pivotal-regate", "\n".join(sb.hub.comments(7)))
+
+    def test_the_run_the_dispatch_starts_does_no_work_and_builds_nothing(self):
+        """The replay is the next slice: until it lands no level starts a regate (job.NOT_STARTED), so the run trust accepts
+        reaches the factory and stops there: no comment, no label, no build, and no second dispatch."""
+        sb, run, pr, sealed = self.sealed_stack()
+        moved = move_main(sb)
+        land = sb.run_workflow(pr_comment_event(sb, pr["number"], "/pivotal land", "alice"))
+        self.assertEqual(land.result("land"), "failure")
+        before = list(sb.hub.comments(7))
+        regate = sb.run_workflow(regate_event(sb, 7, run.inputs["issue_pin"], "pivotal/issue-7/stack", sealed, sb.base_sha))
+        self.assertEqual((regate.trust.outputs["trusted"], regate.trust.outputs["kind"], regate.trust.outputs["issue"]),
+                         ("true", "regate", "7"), regate.trust.step("decide").log)
+        self.assertEqual(regate.result("ack"), "success")
+        self.assertEqual(regate.result("plan"), "success", regate.job("plan").step("decide").log)
+        self.assertEqual(regate.job("plan").step("decide").outputs.get("matrix"), "")
+        for key in ("build", "review", "assemble", "gate", "publish"):
+            self.assertEqual(regate.result(key), "skipped", key)
+        self.assertEqual(sb.hub.comments(7), before, "a quiet run says nothing on the issue")
+        self.assertEqual(len(sb.hub.state()["dispatches"]), 1, "the re-gate starts no second dispatch")
+        self.assertEqual(base_of(sb), moved, "the quiet run moved nothing")
+
+    def test_a_regate_for_another_branch_or_another_pin_is_no_trigger(self):
+        """trust accepts the stack branch of the issue it names and that pin only: a payload for another branch, or with a pin
+        the issue no longer has, resolves to no kind, so no run starts (F5)."""
+        sb, run, pr, sealed = self.sealed_stack()
+        pin = run.inputs["issue_pin"]
+        cases = {
+            "another branch": regate_event(sb, 7, pin, "pivotal/issue-7/main", sealed, sb.base_sha),
+            "another issue": regate_event(sb, 8, pin, "pivotal/issue-8/stack", sealed, sb.base_sha),
+            "a pin that is not a digest": regate_event(sb, 7, "abc", "pivotal/issue-7/stack", sealed, sb.base_sha),
+            "an unknown field": regate_event(sb, 7, pin, "pivotal/issue-7/stack", sealed, sb.base_sha),
+        }
+        cases["an unknown field"][1]["client_payload"]["findings"] = "x"
+        for name, event in cases.items():
+            with self.subTest(case=name):
+                other = sb.run_workflow(event)
+                self.assertEqual((other.trust.outputs["trusted"], other.trust.outputs["kind"]), ("false", "none"),
+                                 other.trust.step("decide").log)
+        # A stranger's sender is refused too, whatever the payload says.
+        stranger = regate_event(sb, 7, pin, "pivotal/issue-7/stack", sealed, sb.base_sha)
+        stranger[1]["sender"] = {"login": "mallory", "type": "User"}
+        other = sb.run_workflow(stranger)
+        self.assertEqual((other.trust.outputs["trusted"], other.trust.outputs["kind"]), ("false", "none"))
+        self.assertEqual(sb.hub.state()["dispatches"], [], "no dispatch came from a re-gate")
 
 
 class CommentStopTest(ScenarioCase):

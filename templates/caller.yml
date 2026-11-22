@@ -14,8 +14,10 @@ on:
   # They are safe here because trust decides first, and no job checks out the event's head.
   issue_comment: # zizmor: ignore[dangerous-triggers]
     types: [created]
+  # pivotal-event (piv event), pivotal-fix (a fix round) and pivotal-regate (the land job's re-gate after a
+  # moved base). The types stay on one line: piv event's caller check reads the list off that line.
   repository_dispatch:
-    types: [pivotal-event, pivotal-fix]
+    types: [pivotal-event, pivotal-fix, pivotal-regate]
   workflow_dispatch:
   workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: [CI] # piv init lists the repo's CI workflows by name
@@ -61,10 +63,10 @@ jobs:
         run: python3 -I pivotal/engine/trust.py >> "$GITHUB_OUTPUT"
 
   factory-trusted:
-    # Every Pivotal secret. Only a trusted go, fix, event or incident gets them.
+    # Every Pivotal secret. Only a trusted go, fix, regate, event or incident gets them.
     name: factory (trusted)
     needs: trust
-    if: needs.trust.outputs.trusted == 'true' && contains(fromJSON('["go","fix","event","incident"]'), needs.trust.outputs.kind)
+    if: needs.trust.outputs.trusted == 'true' && contains(fromJSON('["go","fix","regate","event","incident"]'), needs.trust.outputs.kind)
     concurrency:
       group: pivotal-issue-${{ needs.trust.outputs.issue }}
       queue: max

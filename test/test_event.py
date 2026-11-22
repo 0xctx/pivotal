@@ -34,7 +34,7 @@ NO_CONTENT = "HTTP/2.0 204 No Content\r\nDate: Wed, 28 Oct 2026 00:00:00 GMT\r\n
 LAUNCHER = ROOT / "gh-piv" / "gh-piv"
 WRITE_FLAGS = ("POST", "PUT", "PATCH", "DELETE")
 TEMPLATE = (ROOT / "templates" / "caller.yml").read_text(encoding="utf-8")
-LISTS_EVENT = "types: [pivotal-event, pivotal-fix]"
+LISTS_EVENT = "types: [pivotal-event, pivotal-fix, pivotal-regate]"
 
 
 def is_write(call: dict) -> bool:

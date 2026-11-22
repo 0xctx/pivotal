@@ -201,6 +201,26 @@ it once `piv demo` has an instant no-Kaggle mode, which is not built, so a recor
 - Not built: an instant no-Kaggle `piv demo` mode, so the GIF is not recorded yet.
 - Not released: the `0xctx/pivotal` repo and its release, so `piv init` refuses until a release exists.
 
+**What does pinned mean? Why a commit?**
+Pinned means the caller names one commit, not a tag. Every `uses:` line that calls the engine, the engine checkout's
+`ref:` and the `engine_sha` input all carry the same 40-character commit SHA. A tag is a name that can move: if `v1` is
+force-pushed, a caller that pinned the tag runs whatever `v1` points at that day, and a caller that pinned the old
+commit fails with "ref not found" once that commit is gone. A commit cannot move, so a run today runs the same engine
+code as a run last month, and a reused workflow runs the pinned code only.
+
+`piv init you/my-app --check 'npm test' --release v1.1` pins that tag; `--release` also takes a commit SHA. Without it,
+`piv init` pins the latest release's commit. `piv doctor you/my-app` prints the pin: the engine and the first twelve
+characters of the commit, and says whether that commit is the latest release (a caller behind it is a problem with a
+fix line). To move the pin, re-run `piv init you/my-app --check 'npm test' --update`, or move many
+callers at once with `piv upgrade --owner you`.
+
+**How do I move many repos to a new release?**
+`piv upgrade --owner you` re-pins every repo of yours with the `pivotal` topic; `piv upgrade you/my-app` moves one, and
+`--release v1.1` names the tag or commit to pin instead of the latest release. It prints one line per repo: `current`,
+`updated <old sha12> -> <new sha12>` or `refused: <why>` (a protected default branch, a caller that is not Pivotal's, a
+repo that cannot be read), and exits 1 when any repo was refused. A caller that pins a fork keeps its fork, and no
+variable, secret or label is touched. The recipe is in [docs/EXAMPLES.md](EXAMPLES.md).
+
 **What does the `docs` line check?**
 Its gate runs your check, then the links, the code fences and a short list of misspellings and doubled words (not full spelling).
 

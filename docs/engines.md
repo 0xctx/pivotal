@@ -37,7 +37,7 @@ What the runs of this repo have proved on real GitHub, Kaggle and ngrok. Anythin
 
 **NOT PROVEN LIVE**
 
-- A merge after the base moved. Run 43646729868 stopped at "main moved; re-gate not dispatched": the re-gate after a moved base is not built, so land right after "ready" with no commit to the base in between.
+- A merge after the base moved. Run 43646729868 stopped at "main moved; re-gate not dispatched": land sent no dispatch then. It sends one now (a `repository_dispatch` of type `pivotal-regate`, with the issue, round 0's pin, the issue's stack branch, the sealed sha and the base it was gated on), and trust accepts it; what the run that starts from it does — replay the stack on the new base — is not built, so land right after "ready" with no commit to the base in between still ends with a red land job and nothing replayed.
 - The incident and event triggers.
 - The self-hosted runner tiers.
 - `piv demo`.

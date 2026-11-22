@@ -17,6 +17,12 @@ put in it. The factory acts on ``findings`` only as data in a fenced block; it i
 A ``/pivotal fix`` comment is NOT a fix round: it is a round-0 run from the issue's own text on the default branch (round 0,
 no draft head, no findings). Only this dispatch carries a round.
 
+The land job's re-gate (engine/land.py) is the other dispatch: type ``pivotal-regate`` with ``{issue, pin, branch, sealed_sha,
+base_sha}`` (the keys of ``trust.REGATE_KEYS``), sent when the base moved after the stack was sealed. It carries no slice and no
+round, and its ``branch`` is the issue's own stack branch: the receiver replays the stack on the new base instead of building the
+issue's request again. It is built here, sent with the same argv (``dispatch_argv``) and scanned for the token (``leaks``) as a fix
+round is.
+
 A request with a score (engine/hill.py) has its own bound, ``hill.MAX_ROUNDS``, which the callers pass to ``may_send``. The ``score.max_rounds``
 of a line (lines/*.json, engine/lines.py) is validated and not read: no scorer line is wired.
 
@@ -31,9 +37,12 @@ from collections.abc import Mapping, Sequence
 from engine import build, hill, plan, trust
 
 EVENT_TYPE = "pivotal-fix"
+# The land job's re-gate after a moved base (engine/land.py): the same mechanism, another type and payload (trust.REGATE_EVENT).
+REGATE_EVENT = "pivotal-regate"
 MAX_ROUNDS = plan.DEFAULT_MAX_ROUNDS  # F8: the one bound, shared by publish (send) and plan (refuse)
 MAX_FINDINGS_BYTES = 20 * 1024  # the one cap of the send and the receive
 PAYLOAD_KEYS = trust.PAYLOAD_KEYS  # the receiver's contract: trust pins all but findings (R24)
+REGATE_KEYS = trust.REGATE_KEYS  # the receiver's contract: trust pins all of them (no findings to leave out)
 ISSUE_PIN = re.compile(r"[0-9a-f]{64}")
 # The reasons in land.json of a draft that is worth one more try, and what each is called in the log.
 # A score below the target is a fix reason too (engine/hill.py): the round is sent while the score run has rounds left.
@@ -125,9 +134,17 @@ def payload(*, issue: int, slice_id: str, round_number: int, run_id: int, branch
     return dict(zip(PAYLOAD_KEYS, values, strict=True))
 
 
-def request(data: Mapping) -> bytes:
-    """The body of ``POST /repos/{repo}/dispatches`` as ASCII JSON: ``{"event_type", "client_payload"}``."""
-    return (json.dumps({"event_type": EVENT_TYPE, "client_payload": dict(data)}, ensure_ascii=True) + "\n").encode("ascii")
+def regate_payload(*, issue: int, branch: str, sealed_sha: str, base_sha: str, issue_pin: str) -> dict:
+    """The ``client_payload`` of a re-gate: exactly ``REGATE_KEYS``. ``branch`` is the issue's own stack branch, ``sealed_sha`` the
+    commit the stack was sealed at and ``base_sha`` the base it was gated on; ``issue_pin`` is round 0's pin of the issue text."""
+    values = (issue, issue_pin, branch, sealed_sha, base_sha)
+    return dict(zip(REGATE_KEYS, values, strict=True))
+
+
+def request(data: Mapping, event_type: str = EVENT_TYPE) -> bytes:
+    """The body of ``POST /repos/{repo}/dispatches`` as ASCII JSON: ``{"event_type", "client_payload"}``. The event type is a fix
+    round's by default and the re-gate's when the caller passes ``REGATE_EVENT``."""
+    return (json.dumps({"event_type": event_type, "client_payload": dict(data)}, ensure_ascii=True) + "\n").encode("ascii")
 
 
 def dispatch_argv(repo: str, path: str) -> list[str]:

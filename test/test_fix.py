@@ -321,7 +321,7 @@ class PublishFixTest(PublishCase):
 
     def test_the_caller_listens_for_the_event_type(self):
         text = (Path(__file__).resolve().parent.parent / "templates" / "caller.yml").read_text()
-        self.assertIn("types: [pivotal-event, pivotal-fix]", text)
+        self.assertIn("types: [pivotal-event, pivotal-fix, pivotal-regate]", text)
 
 
 class TwoCandidatesTest(PublishCase):

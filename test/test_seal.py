@@ -263,7 +263,7 @@ class VerifierTest(SealFixture):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.refuses("land_invalid", check_runs=self.runs(summary=seal.summary(hashlib.sha256(raw).hexdigest(), ["one"])))
-        self.assertIn("version must be 2", err.getvalue())
+        self.assertIn(f"version must be {assemble.LAND_VERSION}", err.getvalue())
 
     def test_f6_the_hash_is_compared_before_land_json_is_parsed(self):
         self.fixture("one")

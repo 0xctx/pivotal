@@ -39,8 +39,8 @@ THE STEPS (each is a function; the order is the plan's)
    (`refs/heads/pivotal/issue-<n>/stack`) into a scratch repository, and `publish.verify_branch` proves that the head is the
    sealed commit and that the chain base..head is exactly the commits of land.json up to it, in a straight line, none in `.github`.
 3. THE BASE (`move`). The default branch's tip is read (`git ls-remote`). It must be `land.json`'s `base_sha` (the base the stack was
-   built and gated on). Anything else is a MOVED base: nothing is pushed, a `repository_dispatch` of type `pivotal-fix` is sent
-   (see "Re-gate" below) and the issue gets a comment that says so. Already at the sealed commit, or containing it, is landed
+   built and gated on). Anything else is a MOVED base: nothing is pushed, a `repository_dispatch` of type `pivotal-regate` is
+   sent (see "Re-gate" below) and the issue gets a comment that says so. Already at the sealed commit, or containing it, is landed
    already: no push. A base that is not `base_sha` but HOLDS the sealed commit (as the commit, on its first-parent chain, or as the second
    parent of a merge with the sealed tree) is landed already and is judged by step 5, not a re-gate.
 4. THE PUSH (`move`). One plain `git push <sealed sha>:refs/heads/<default>` (`publish.push_args`: no `--force`, `+`, `--mirror`, `--delete`),
@@ -74,17 +74,16 @@ stack PR at `ask`, `prepare` and `land` when the run's effective level is not he
 human's "land it" can land a stack sealed at `ask` or `prepare` as well as one the pipeline sealed at `land`. `watch` starts
 nothing, so it seals nothing.
 
-RE-GATE. "Re-dispatch the factory (a re-gate)" uses the caller's dispatch mechanism: `repository_dispatch`, type `pivotal-fix`,
-built by `fix.payload`, `fix.request` and `fix.dispatch_argv` as publish builds a fix round: the keys of `trust.FIX_PIN_FIELDS`
-(issue, slice, round, run_id, branch, head_sha, issue_pin) and a fixed `findings` text. Its `issue_pin` is round 0's pin, which the
-land artifact must carry (`carried_pin`; assemble writes no such key yet). Until it does, the pin is "" and NOTHING is dispatched:
-the comment says the pin is missing and the job is RED (R16). The pin is never read from the issue's live title and body: the
-receiver would then take an edited text's pin for round 0's. The dispatch's `branch` is the stack branch, which trust refuses
-(`trust.fix_payload_problem`: the branch must be the issue's own slice draft branch, `pivotal/issue-<n>/<slice>`), so a sent re-gate
-starts no run; that is not fixed here (see the report). `GITHUB_TOKEN` may trigger `repository_dispatch`. NOT VERIFIED:
-that GitHub delivers a token-made dispatch at all. The job stays RED (`land_outcome=regate`, exit 1) whatever the dispatch did, so no
-run claims a re-gate that nobody makes. When the pin is carried and the branch is accepted, update this paragraph, the comment and
-the exit status together.
+RE-GATE. "Re-dispatch the factory (a re-gate)" uses the caller's dispatch mechanism: `repository_dispatch`, type `pivotal-regate`,
+built by `fix.regate_payload`, `fix.request` and `fix.dispatch_argv`: the keys of `trust.REGATE_KEYS` (issue, pin, branch, sealed_sha,
+base_sha). Its `pin` is round 0's pin of the issue text, which the land artifact carries (`carried_pin`, assemble's `issue_pin`), so
+the receiver replays the stack the run was trusted on; with no pin NOTHING is dispatched and the comment says so (R16). The pin is
+never read from the issue's live title and body: the receiver would then take an edited text's pin for round 0's. The dispatch's
+`branch` is the stack branch of the issue it names (`assemble.stack_branch`), which `trust.regate_payload_problem` accepts for that
+issue and no other: a re-gate can never name another branch. `GITHUB_TOKEN` may trigger `repository_dispatch`. NOT VERIFIED: that
+GitHub delivers a token-made dispatch at all, and that the factory's answer to one replays anything: the replay is the next slice
+(land-regate-replay), so until it lands the run that starts from this dispatch does no work. The job stays RED (`land_outcome=regate`,
+exit 1) whatever the dispatch did, so no run claims a re-gate that nobody replays.
 
 CONCURRENCY. land.yml serializes land jobs per repository (`cancel-in-progress: false`) and the push is a fast-forward from a base
 that was read just before, so two lands cannot both pass; the second finds the base moved and re-gates.
@@ -136,14 +135,17 @@ LAND_ARTIFACT = "land"  # the artifact's name; land.json is the file in it
 # call): only the download calls get this one.
 DOWNLOAD_TIMEOUT_SECONDS = 300
 MERGE_METHOD = "merge"
-FINDINGS = "The base moved after the stack was sealed. Re-gate the stack on the new base."
 REGATE_NOT_SENT = {  # the comment's reason when no dispatch was sent; the job is red either way
     "pin": "The re-gate was not dispatched: the land artifact carries no pin of the issue text that round 0 was trusted on, and the "
-           "factory refuses a fix round without one. Re-run the issue with /pivotal go trusted.",
+           "factory refuses a re-gate without one. Re-run the issue with /pivotal go trusted.",
     "dispatch": "The dispatch to re-gate the stack failed: re-run the issue with /pivotal go trusted.",
     "unknown": "The dispatch to re-gate the stack was made and GitHub's answer is not known, so a re-gate may have been started: look at "
                "the Actions tab before you re-run the issue with /pivotal go trusted.",
 }
+# The comment's word when the dispatch was accepted: it names the event, the branch it may replay and what the factory does with
+# it today (the replay is the next slice, land-regate-replay), so the issue never claims a landing.
+REGATE_SENT = ("A re-gate was dispatched (a repository_dispatch of type pivotal-regate) to replay the stack on the new base. The "
+               "replay itself is not built yet, so no run replays anything from it: re-run the issue with /pivotal go trusted.")
 OUTCOMES = ("landed", "regate", "not_landed")
 WHY_NOT = {
     "rejected": "the push was refused and so was the merge through the API (branch protection, a required review or required checks)",
@@ -678,21 +680,23 @@ def close_issue(hub: Hub, s: Settings, issue: int) -> None:
 
 
 def carried_pin(found: Sealed) -> str:
-    """Round 0's pin of the issue text, as the land artifact carries it, or "" (assemble writes no such key yet). It is never
+    """Round 0's pin of the issue text, as the land artifact carries it (assemble's `issue_pin`), or "". It is never
     minted from the live title and body (R16): an edited text's pin would pass for round 0's."""
     pin = found.land.get("issue_pin")
     return pin if isinstance(pin, str) else ""
 
 
 def regate(hub: Hub, s: Settings, issue: int, found: Sealed, work: Path, pin: str) -> str:
-    """Dispatch the factory again (see the module docstring), built as publish builds a fix round: ``fix.payload``, ``fix.request``
-    and ``fix.dispatch_argv``, so the keys are the receiver's ``trust.FIX_PIN_FIELDS`` plus ``findings``. "" when GitHub accepted
-    the dispatch, else the reason it was not sent: ``pin`` (no round-0 pin) or ``dispatch``, or ``unknown`` (the answer is not known)."""
+    """Dispatch the factory again (see the module docstring), built as the land job's re-gate: ``fix.regate_payload``,
+    ``fix.request`` with ``fix.REGATE_EVENT`` and ``fix.dispatch_argv``, so the keys are the receiver's ``trust.REGATE_KEYS``:
+    the issue, round 0's pin, the issue's own stack branch, the sealed sha and the base it was gated on. "" when GitHub accepted
+    the dispatch, else the reason it was not sent: ``pin`` (no round-0 pin) or ``dispatch``, or ``unknown`` (the answer is not
+    known)."""
     if fix.ISSUE_PIN.fullmatch(pin) is None:
         return "pin"
-    body = fix.request(fix.payload(
-        issue=issue, slice_id=found.prefix[0], round_number=1, run_id=found.run_id, branch=assemble.stack_branch(issue),
-        head=found.sha, issue_pin=pin, scores="", findings=FINDINGS))
+    body = fix.request(fix.regate_payload(
+        issue=issue, branch=assemble.stack_branch(issue), sealed_sha=found.sha, base_sha=found.land["base_sha"], issue_pin=pin),
+        fix.REGATE_EVENT)
     if fix.leaks(body, s.token):
         return "dispatch"
     path = work / "dispatch.json"
@@ -738,9 +742,7 @@ def land(env: Mapping[str, str]) -> None:
             f"{sha} was gated, " + (
                 "and whether it holds the sealed commit could not be read; " if result.unread else "so it moved after the seal; ") +
             "nothing was pushed. " + (
-                "A re-gate was dispatched (a repository_dispatch of type pivotal-fix), but the factory refuses a dispatch that names "
-                "the stack branch, so no run is expected to start from it. Re-run the issue with /pivotal go trusted." if sent else
-                REGATE_NOT_SENT[failure])
+                REGATE_SENT if sent else REGATE_NOT_SENT[failure])
         )
         try:
             comment(hub, s, issue, text)
@@ -748,9 +750,9 @@ def land(env: Mapping[str, str]) -> None:
             problems.append(str(err))
         finish(env, s, "regate", sha)
         print(f"land: {default} moved; re-gate " + ("dispatched" if sent else "not dispatched (" + failure + ")"))
-        # Red either way: trust refuses the stack branch (see the module docstring), so a dispatch that was made starts no run,
-        # and a green job would claim a re-gate that nobody makes.
-        raise JobError(("the base moved; the re-gate was dispatched, but the factory refuses a dispatch that names the stack branch" if sent
+        # Red either way: the job did not land, and the replay of the stack on the new base is the next slice (land-regate-replay),
+        # so a green job would claim a re-gate that nothing has replayed yet.
+        raise JobError(("the base moved; a re-gate was dispatched to replay the stack on it, but the replay is not wired yet" if sent
                         else "the base moved and the re-gate could not be dispatched")
                        + (f"; and the comment failed: {problems[0]}" if problems else ""))
     verdict = check_base(git, default, sha, result if isinstance(result, Merge) else None)

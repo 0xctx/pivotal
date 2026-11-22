@@ -26,13 +26,15 @@ step "kaggle probe --help" python3 spikes/kaggle_probe.py --help
 step "kaggle/catalog.json is JSON" python3 -m json.tool kaggle/catalog.json
 step "docs/engines.md marks UNMEASURED" grep -q 'UNMEASURED' docs/engines.md
 
-# Every markdown file passes the docs line's checker: links, code fences and spelling.
+# The docs line's checker: links, code fences and spelling of every Markdown file. engine/doccheck.py takes its file
+# list from its own helper: the tracked files of a git checkout, or the walk of the tree when there is no checkout, so an
+# untracked scratch file in a local worktree is not a doc and does not fail the gate.
 step "doccheck of every Markdown file" python3 -I engine/doccheck.py .
 
 # The piv CLI runs, and every subcommand the docs name answers --help. argparse exits before gh is built, so no GitHub
 # call is made. test/test_docs.py holds this list to cli.build_parser(): a subcommand missing here is a red test.
 step "gh piv --help" python3 gh-piv/gh-piv --help
-subs=(init "do" kaggle land fix stop level now doctor remove preset event digest resume demo runner)
+subs=(init upgrade "do" kaggle land fix stop level now doctor remove preset event digest resume demo runner)
 for sub in "${subs[@]}"; do
   step "gh piv $sub --help" python3 gh-piv/gh-piv "$sub" --help
 done

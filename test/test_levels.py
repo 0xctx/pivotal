@@ -569,6 +569,9 @@ class PrepareTest(PlanBase, AckBase):
 
     def test_the_default_level_starts_the_operators_work_and_incidents(self):
         for kind in job.KINDS:
+            if kind in job.NOT_STARTED:  # a regate starts at no level until the replay is built (land-regate-replay)
+                self.assertIsNone(job.read_start("", "make test", kind), kind)
+                continue
             self.assertEqual(job.read_start("", "make test", kind), job.Standing("prepare", "prepare"))
         self.assertEqual(self.run_ack(LEVEL=""), 0, self.stderr)
 

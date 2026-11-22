@@ -600,6 +600,9 @@ jobs:
         id: assemble
         env:
           ISSUE: ${{ needs.ack.outputs.issue }}
+          # Round 0's pin of the issue text (plan's output, checked against the live issue there): land.json carries it so the
+          # land job's re-gate names the text the run was trusted on, never the live one (engine/land.py carried_pin).
+          ISSUE_PIN: ${{ needs.plan.outputs.issue_pin }}
           BASE_SHA: ${{ needs.plan.outputs.base_sha }}
           MATRIX: ${{ needs.plan.outputs.matrix }}
           BASELINE: ${{ needs.plan.outputs.baseline }}

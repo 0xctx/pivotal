@@ -13,7 +13,8 @@ Run from the repo root. All of these must pass before a change lands.
 - `actionlint -ignore 'unexpected key "queue" for "concurrency" section'`: workflow lint, discovering every workflow. Then the same with `templates/caller.yml`, because the pinned actionlint predates the `queue` key the caller and the publish job use.
 - `zizmor .github engine/setup/action.yml templates/caller.yml`: workflow, action and caller security audit. Set `GH_TOKEN` for the online audits.
 - `bash test/docs.sh`: the docs gate (F9). It runs `python3 -I engine/doccheck.py .` (links, code fences and spelling in every
-  Markdown file), `--help` of each `piv` subcommand (the list is held to `cli.build_parser()` by `test/test_docs.py`), the
+  tracked Markdown file, or in the walk of the tree when the directory is not a git checkout), `--help` of each `piv`
+  subcommand (the list is held to `cli.build_parser()` by `test/test_docs.py`), the
   UNMEASURED check on `docs/engines.md`, `spikes/kaggle_probe.py --help`, and `spikes/headless_probe.sh claude`. The probe runs
   `claude --version`, `--help` and an unknown flag when claude is on PATH; without it the probe reports `not installed` and
   passes. No live model call is made. CI runs it as its last step (`.github/workflows/ci.yml`). A failing step stops the run

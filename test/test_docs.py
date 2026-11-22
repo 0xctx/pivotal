@@ -351,6 +351,13 @@ class DocsScriptTest(unittest.TestCase):
             if re.match(r"^\s*(python3|bash|grep)\b", line):
                 self.fail(f"test/docs.sh line {number} runs a command outside step: {line.strip()}")
 
+    def test_the_doccheck_step_runs_the_shared_scan_of_the_markdown_files(self):
+        # The gate's own step. doccheck reads its file list from engine/doccheck.py's helper (the tracked files of a git
+        # checkout, else the walk), so a checkout with untracked scratch files still passes: mutant: the step is dropped.
+        steps = re.findall(r'^step "([^"]+)" (.*)$', DOCS_SH.read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertEqual([command for _name, command in steps if "doccheck.py" in command],
+                         ["python3 -I engine/doccheck.py ."], "test/docs.sh no longer runs doccheck on the tree")
+
 
 class OperatorDocsTest(unittest.TestCase):
     def test_agents_md_lists_the_docs_gate_and_says_what_its_probe_needs(self):
@@ -1939,6 +1946,187 @@ class QuietLineTest(unittest.TestCase):
         self.assertNotIn("and nothing else", examples.split(QUIET_INCIDENT, 1)[1].split(".", 1)[0])
         self.assertIn(f"`{QUIET_EVENT}`", examples)
         self.assertNotIn("the log says the event starts no run", examples)
+
+
+# The release rule (CONTRIBUTING.md, the FAQ and SECURITY.md): a published tag is immutable, a fix is a new tag on top of
+# the history, and the caller pins a commit because a reused workflow runs the pinned code only. Each phrase the tests below
+# require is a fact the code has: `--release` and `--update` are piv init's flags (gh-piv/piv/cli.py, init.resolve_release,
+# init.plan_caller), the pin line is doctor.caller's and doctor.pin compares it with the latest release, and `piv upgrade`
+# is a subcommand that moves many callers at once (gh-piv/piv/upgrade.py, and the line it prints per repo).
+
+CONTRIBUTING = ROOT / "CONTRIBUTING.md"
+PIN_QUESTION = "What does pinned mean? Why a commit?"
+
+
+def release_rule_problems(text: str) -> list[str]:
+    """Why a "Releases and pins" section does not state the rule, or [] when it states all of it."""
+    flat_text = flat(text)
+    problems = []
+    for phrase in (
+        "A published tag is immutable",
+        "never moved, deleted or force-pushed",
+        "A fix ships as a new tag on top of the history",
+        "before anyone else pins",
+        "`piv init REPO --release v1.1`",
+        "`piv init REPO --check 'your check command' --update`",
+        "`piv upgrade --owner OWNER`",
+        "`refused: <why>`",
+    ):
+        if phrase not in flat_text:
+            problems.append(f"the section does not say: {phrase}")
+    unknown = sorted(word for word in PIV_WORDS.findall(text) if word not in subcommands())
+    if unknown:
+        problems.append("the section names piv subcommands that do not exist: " + ", ".join(unknown))
+    return problems
+
+
+def pin_answer_problems(answer: str) -> list[str]:
+    """Why the FAQ's pin answer does not say what a pin is and why it is a commit, or [] when it does."""
+    flat_answer = flat(answer)
+    problems = []
+    for phrase in (
+        "names one commit, not a tag",
+        "40-character commit SHA",
+        "a reused workflow runs the pinned code only",
+        "ref not found",
+        "`--release` also takes a commit SHA",
+        "`piv upgrade --owner you`",
+    ):
+        if phrase not in flat_answer:
+            problems.append(f"the answer does not say: {phrase}")
+    unknown = sorted(word for word in PIV_WORDS.findall(answer) if word not in subcommands())
+    if unknown:
+        problems.append("the answer names piv subcommands that do not exist: " + ", ".join(unknown))
+    return problems
+
+
+class ReleasesAndPinsTest(unittest.TestCase):
+    """The release rule in the three docs: CONTRIBUTING.md's "Releases and pins", the FAQ's pin question, and the SECURITY.md
+    line on why the caller pins a commit. Each phrase is tied to the code the docs describe."""
+
+    RULE_PHRASES = (
+        "A published tag is immutable",
+        "never moved, deleted or force-pushed",
+        "A fix ships as a new tag on top of the history",
+        "before anyone else pins",
+        "`piv init REPO --release v1.1`",
+        "`piv init REPO --check 'your check command' --update`",
+        "`piv upgrade --owner OWNER`",
+        "`refused: <why>`",
+    )
+    ANSWER_PHRASES = (
+        "names one commit, not a tag",
+        "40-character commit SHA",
+        "a reused workflow runs the pinned code only",
+        "ref not found",
+        "`--release` also takes a commit SHA",
+        "`piv upgrade --owner you`",
+    )
+
+    def setUp(self):
+        self.rules = section(CONTRIBUTING.read_text(encoding="utf-8"), "## Releases and pins")
+        self.answer = faq_answer(FAQ.read_text(encoding="utf-8"), PIN_QUESTION)
+        self.security = flat(SECURITY.read_text(encoding="utf-8"))
+
+    def test_the_contributing_section_states_the_release_rule(self):
+        self.assertEqual(release_rule_problems(self.rules), [])
+
+    def test_a_mutant_that_drops_any_one_phrase_of_the_rule_is_named(self):  # the mutant each phrase is checked with
+        for phrase in self.RULE_PHRASES:
+            with self.subTest(dropped=phrase):
+                mutant = flat(self.rules).replace(phrase, "something else")
+                problems = release_rule_problems(mutant)
+                self.assertTrue(any(phrase in problem for problem in problems), problems)
+
+    def test_the_faq_answers_what_pinned_means_and_why_a_commit(self):
+        self.assertEqual(pin_answer_problems(self.answer), [])
+
+    def test_a_mutant_that_drops_any_one_phrase_of_the_pin_answer_is_named(self):
+        for phrase in self.ANSWER_PHRASES:
+            with self.subTest(dropped=phrase):
+                mutant = self.answer.replace(phrase, "something else")
+                problems = pin_answer_problems(mutant)
+                self.assertTrue(any(phrase in problem for problem in problems), problems)
+
+    def test_the_security_line_says_why_the_caller_pins_a_commit(self):
+        self.assertIn("a reused workflow runs the pinned code only", self.security)
+        self.assertIn("A tag is a name that can move, so it is not a pin", self.security)
+        self.assertIn("the `--release` flag of `piv init` resolves the tag or commit it names to the commit", self.security)
+
+    def test_the_two_flags_the_docs_name_are_init_s_own(self):
+        # --release (a tag or a commit, resolved to the commit by init.resolve_release) and --update (init.plan_caller)
+        # are the two flags the three docs name, so neither is invented.
+        source = (ROOT / "gh-piv" / "piv" / "cli.py").read_text(encoding="utf-8")
+        for flag in ("--release", "--update"):
+            with self.subTest(flag=flag):
+                self.assertIn(f'add_argument("{flag}"', source)
+        self.assertIn("A differing file needs ``--update``",
+                      (ROOT / "gh-piv" / "piv" / "init.py").read_text(encoding="utf-8"))
+
+    def test_the_doctor_pin_line_the_docs_describe_is_the_one_doctor_prints(self):
+        source = (ROOT / "gh-piv" / "piv" / "doctor.py").read_text(encoding="utf-8")
+        self.assertIn("pinned to {sha[:12]}", source)
+        self.assertIn("first twelve", self.rules)
+        self.assertIn("first twelve", self.answer)
+
+
+UPGRADE_QUESTION = "How do I move many repos to a new release?"
+UPGRADE_PHRASES = (
+    "`piv upgrade --owner you`",
+    "`--release v1.1`",
+    "`current`",
+    "`updated <old sha12> -> <new sha12>`",
+    "`refused: <why>`",
+    "exits 1",
+    "keeps its fork",
+)
+
+
+def upgrade_answer_problems(answer: str) -> list[str]:
+    """Why the FAQ's upgrade answer does not say what piv upgrade does, or [] when it does."""
+    flat_answer = flat(answer)
+    problems = []
+    for phrase in UPGRADE_PHRASES:
+        if phrase not in flat_answer:
+            problems.append(f"the answer does not say: {phrase}")
+    unknown = sorted(word for word in PIV_WORDS.findall(answer) if word not in subcommands())
+    if unknown:
+        problems.append("the answer names piv subcommands that do not exist: " + ", ".join(unknown))
+    return problems
+
+
+class UpgradeDocTest(unittest.TestCase):
+    """piv upgrade (the release rule) where a reader looks: the many-repos recipe runs it, and the FAQ answers how to move
+    many repos, with its options and the one line per repo it prints. Each phrase is tied to the code: the flags are the
+    parser's, and the three lines are the ones gh-piv/piv/upgrade.py prints."""
+
+    def setUp(self):
+        self.answer = faq_answer(FAQ.read_text(encoding="utf-8"), UPGRADE_QUESTION)
+
+    def test_the_many_repos_recipe_runs_the_upgrade_command(self):
+        self.assertIn(["upgrade", "--owner", "you"], piv_commands(EXAMPLES), "the several-repos recipe does not upgrade")
+
+    def test_the_faq_answers_how_to_move_many_repos_with_its_options_and_its_lines(self):
+        self.assertEqual(upgrade_answer_problems(self.answer), [])
+
+    def test_a_mutant_that_drops_any_one_phrase_of_the_upgrade_answer_is_named(self):
+        for phrase in UPGRADE_PHRASES:
+            with self.subTest(dropped=phrase):
+                problems = upgrade_answer_problems(self.answer.replace(phrase, "something else"))
+                self.assertTrue(any(phrase in problem for problem in problems), problems)
+
+    def test_the_lines_the_docs_name_are_the_ones_upgrade_prints(self):
+        source = (ROOT / "gh-piv" / "piv" / "upgrade.py").read_text(encoding="utf-8")
+        self.assertIn('return f"piv upgrade {repo}: {state}{fork}"', source)
+        self.assertIn('f"updated {pinned[:12]} -> {sha[:12]}"', source)
+        self.assertIn('f"refused: {err}"', source)
+
+    def test_the_two_flags_the_answer_names_are_the_parsers_own(self):
+        source = (ROOT / "gh-piv" / "piv" / "cli.py").read_text(encoding="utf-8")
+        for flag in ("--owner", "--release"):
+            with self.subTest(flag=flag):
+                self.assertIn(f'add_argument("{flag}"', source)
+        self.assertIn("upgrade", subcommands(), "piv has no upgrade subcommand")
 
 
 if __name__ == "__main__":

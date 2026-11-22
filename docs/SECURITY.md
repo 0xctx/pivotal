@@ -26,6 +26,11 @@ real GitHub, Kaggle or ngrok yet.
 The caller is one file in your repo, `.github/workflows/pivotal.yml`, copied from `templates/caller.yml`. It
 receives every trigger, and `trust` decides who the trigger is from before any job gets a secret.
 
+Every engine reference in the caller is a pin to one commit: the `uses:` lines, the engine checkout's `ref:` and the
+`engine_sha` input all carry the same 40-character commit SHA, so a reused workflow runs the pinned code only. A tag is
+a name that can move, so it is not a pin: the `--release` flag of `piv init` resolves the tag or commit it names to the
+commit and writes that.
+
 ```text
  label, comment, red CI on main, piv event, piv do
         │

@@ -33,7 +33,9 @@ Outcomes of a slice (`land.json`, `check_land`; the table in `classify`):
 
 Not every slice has a branch: `conflict`, `blocked` and `failed` slices have none and are not in the bundle. The bundle holds
 the draft branches and the stack branch, and `base_sha` is its only prerequisite. `candidate` is not permission to land: it
-says the slice is on the stack. The gate (engine/gatejob.py) and the level decide. The `review-<id>` artifacts are hostile input as
+says the slice is on the stack. `issue_pin` is the pin of the issue text the run was trusted on (round 0's, `trust.issue_pin`),
+carried so the land job's re-gate can name the same text; it is "" for a kind with no issue, and the land job refuses a re-gate
+without it (engine/land.py `carried_pin`). The gate (engine/gatejob.py) and the level decide. The `review-<id>` artifacts are hostile input as
 the slice artifacts are: `review.load` reads them (exactly the three files, regular, validated, re-parsed) and a missing,
 malformed or stale one is never a candidate (F5). The `files` of a verdict are reproduced here from the same apply: the names
 git reads from the patch plus every file the apply added or removed.
@@ -48,7 +50,8 @@ on `base_sha`, and it is a `draft` named `fix_round` (or the reason the gate or 
 stacked and never lands by itself. Publish fast-forwards the slice's own branch to it.
 
 Run as `python3 -I pivotal/engine/assemble.py run` with these environment variables: ISSUE, BASE_SHA, MATRIX (the plan's
-slices), BASELINE (green, red or none), REPO_DIR (a checkout holding BASE_SHA), SLICES_DIR (the downloaded `slice-*`
+slices), BASELINE (green, red or none), KIND (the run's kind), ISSUE_PIN (round 0's pin of the issue text, plan's `issue_pin`
+output; "" for a kind with no issue), REPO_DIR (a checkout holding BASE_SHA), SLICES_DIR (the downloaded `slice-*`
 artifacts), REVIEWS_DIR (the downloaded `review-*` artifacts), OUT_DIR and WORK_DIR (neither may exist), GITHUB_OUTPUT. Job outputs: positions, gate_matrix (the same ids as a JSON array, `[]` without a stack), has_stack, land_sha256, assembled. Every refusal is raised before the first write.
 """
 
@@ -86,7 +89,8 @@ MAX_COMMITS = 50  # per slice
 MAX_BUNDLE_BYTES = 1024 * 1024 * 1024
 MAX_LAND_BYTES = 256 * 1024
 LAND, BUNDLE = "land.json", "pivotal.bundle"
-LAND_VERSION = 2  # 2: a slice carries its score `target` and the `reviewed_by` of a met fix round (engine/hill.py)
+LAND_VERSION = 3  # 2: a slice carries its score `target` and the `reviewed_by` of a met fix round (engine/hill.py);
+# 3: land.json carries `issue_pin`, round 0's pin of the issue text, which the land job forwards to a re-gate (engine/land.py)
 
 OUTCOMES = ("candidate", "draft", "blocked", "conflict", "failed")
 STACK = "stack"  # the last part of the stack branch; plan.RESERVED_IDS keeps it from being a slice id
@@ -101,7 +105,7 @@ _DELTA_HEADER_BYTES = 20  # a delta starts with two varints (source size, target
 _CANONICAL_SIZE = re.compile(rb"[1-9][0-9]{0,8}|0")  # git also reads zero-padded and huge sizes, so only this form is counted
 MAX_LITERAL_BYTES = 64 * 1024 * 1024  # the sum over one patch; a few KB of zlib can declare hundreds of MB
 
-LAND_KEYS = frozenset({"version", "issue", "base_sha", "baseline", "bundle", "has_stack", "positions", "slices"})
+LAND_KEYS = frozenset({"version", "issue", "base_sha", "baseline", "issue_pin", "bundle", "has_stack", "positions", "slices"})
 SLICE_KEYS = frozenset(
     {"id", "outcome", "reason", "candidate", "branch", "head", "commits", "built_by", "gate", "fell_back", "score", "target",
      "reviewed_by"})
@@ -163,6 +167,12 @@ def check_land(data: object) -> dict:
         raise LandError("base_sha must be a commit SHA")
     if data["baseline"] not in BASELINES:
         raise LandError(f"baseline must be one of {', '.join(BASELINES)}")
+    # Round 0's pin of the issue text (trust.issue_pin), or "" when the run was started by a kind with no issue (an incident,
+    # an event). The land job re-gates with it and refuses when it is empty: a re-gate must be pinned to the text the run was
+    # trusted on, never to the live one (F2b, engine/land.py carried_pin).
+    issue_pin = data["issue_pin"]
+    if not isinstance(issue_pin, str) or (issue_pin and SHA256.fullmatch(issue_pin) is None):
+        raise LandError("issue_pin must be a sha256 digest or empty")
     slices = data["slices"]
     if not isinstance(slices, list) or not 1 <= len(slices) <= plan.MAX_SLICES:
         raise LandError(f"slices must be a list of 1 to {plan.MAX_SLICES}")
@@ -899,6 +909,7 @@ class Settings:
     slices: tuple[plan.Slice, ...]
     baseline: str
     kind: str  # the run's kind (trust.KINDS): an incident's green base is already_green, every other kind is classified as before
+    pin: str  # round 0's pin of the issue text (plan's `issue_pin` output), carried in land.json for the land job's re-gate
     repo_dir: Path
     slices_dir: Path
     reviews_dir: Path
@@ -930,6 +941,11 @@ def read_settings(env: Mapping[str, str]) -> Settings:
     kind = env.get("KIND", "")  # the run's kind, from the caller: a missing or unknown one is refused, never read as "not an incident"
     if kind not in trust.KINDS:
         raise JobError(f"KIND must be one of {', '.join(sorted(trust.KINDS))}")
+    # The pin of the issue text this run was trusted on (plan's `issue_pin` output), or "" for a kind with no issue. It is not
+    # minted here and never read from the live issue: land.json carries it so the land job can re-gate on the same text (F2b).
+    pin = env.get("ISSUE_PIN", "")
+    if pin and SHA256.fullmatch(pin) is None:
+        raise JobError("ISSUE_PIN is not a sha256 digest")
     repo_dir, slices_dir = _absolute(env, "REPO_DIR"), _absolute(env, "SLICES_DIR")
     reviews_dir = _absolute(env, "REVIEWS_DIR")
     out_dir, work_dir = _absolute(env, "OUT_DIR"), _absolute(env, "WORK_DIR")
@@ -939,7 +955,7 @@ def read_settings(env: Mapping[str, str]) -> Settings:
     for name, path in (("REPO_DIR", repo_dir), ("SLICES_DIR", slices_dir), ("REVIEWS_DIR", reviews_dir)):
         if not path.is_dir():
             raise JobError(f"{name} is not a directory")
-    return Settings(issue, base, slices, baseline, kind, repo_dir, slices_dir, reviews_dir, out_dir, work_dir,
+    return Settings(issue, base, slices, baseline, kind, pin, repo_dir, slices_dir, reviews_dir, out_dir, work_dir,
                     job.read_output_path(env))
 
 
@@ -988,7 +1004,7 @@ def assemble(env: Mapping[str, str]) -> None:
             raise JobError("the bundle could not be made") from None
         bundle = {"name": BUNDLE, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
     land = {
-        "version": LAND_VERSION, "issue": s.issue, "base_sha": s.base, "baseline": s.baseline, "bundle": bundle,
+        "version": LAND_VERSION, "issue": s.issue, "base_sha": s.base, "baseline": s.baseline, "issue_pin": s.pin, "bundle": bundle,
         "has_stack": bool(positions), "positions": positions, "slices": entries,
     }
     try:

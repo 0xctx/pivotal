@@ -58,6 +58,31 @@ def dispatch(sender="alice", sender_type="User", repository=REPO, client_payload
     }
 
 
+ISSUE_TITLE, ISSUE_BODY = "Ship the stack", "The goal of the issue.\n"
+# Round 0's pin of the issue text above: what a re-gate carries and what the receiver compares with the live issue.
+ISSUE_PIN = hashlib.sha256(json.dumps([ISSUE_TITLE, ISSUE_BODY]).encode("ascii")).hexdigest()
+
+
+def regate(*, issue=7, pin=None, branch=None, sealed=None, base=None, sender="github-actions[bot]", sender_type="Bot",
+           repository=REPO, action="pivotal-regate", **extra):
+    """A pivotal-regate repository_dispatch as the land job sends it (engine/fix.py regate_payload): the issue, round 0's pin,
+    the issue's own stack branch, the sealed commit and the base it was gated on."""
+    payload = {
+        "issue": issue, "pin": ISSUE_PIN if pin is None else pin,
+        "branch": f"pivotal/issue-{issue}/stack" if branch is None else branch,
+        "sealed_sha": "b" * 40 if sealed is None else sealed,
+        "base_sha": "c" * 40 if base is None else base,
+    }
+    payload.update(extra)
+    return {"action": action, "sender": {"login": sender, "type": sender_type},
+            "repository": {"full_name": repository}, "client_payload": payload}
+
+
+def issue_reply(title=ISSUE_TITLE, body=ISSUE_BODY):
+    """The issue read as the API answers it (the pin a re-gate must carry)."""
+    return json.dumps({"number": 7, "title": title, "body": body})
+
+
 class FakeGhTest(unittest.TestCase):
     """Each test runs the real gh lookup against a fake gh on PATH (F2b)."""
 
@@ -246,7 +271,13 @@ class ResolveTest(unittest.TestCase):
 
 class KindsTest(unittest.TestCase):
     def test_kinds_are_the_contract_set(self):
-        self.assertEqual(t.KINDS, {"go", "fix", "land", "stop", "event", "incident", "none"})
+        self.assertEqual(t.KINDS, {"go", "fix", "land", "stop", "event", "incident", "regate", "none"})
+
+    def test_the_stack_branch_constant_is_the_one_assemble_writes(self):
+        # trust cannot import assemble (assemble imports trust), so the last part of a stack branch is repeated here.
+        from engine import assemble
+        self.assertEqual(t.STACK, assemble.STACK)
+        self.assertEqual(f"pivotal/issue-7/{t.STACK}", assemble.stack_branch(7))
 
     def test_every_output_kind_is_a_known_kind(self):
         samples = [
@@ -440,6 +471,138 @@ class IncidentTriggerTest(FakeGhTest):
         self.assertEqual(t.resolve("workflow_run", workflow_run({"conclusion": "success"}), REPO), (None, None, "none"))
         self.assertEqual(t.resolve("workflow_run", workflow_run(), ""), (None, None, "none"))
         self.assertEqual(t.resolve("repository_dispatch", dispatch(repository="you/other"), REPO), (None, None, "none"))
+
+
+class RegateTriggerTest(FakeGhTest):
+    """The land job's re-gate: a pivotal-regate dispatch, trusted only from this repository's own token, for the stack branch of
+    the issue it names, with the pin of the issue text as it is now (engine/land.py, engine/fix.py)."""
+
+    PIN = ISSUE_PIN
+    SEALED = "b" * 40
+    BASE = "c" * 40
+
+    def regate(self, **over):
+        return regate(**over)
+
+    def gh_issue(self, title=ISSUE_TITLE, body=ISSUE_BODY):
+        """The fake gh answers the issue read with this title and body (the pin the re-gate must carry)."""
+        self.bins.add_routed("gh", {"/issues/7": (issue_reply(title, body), 0)})
+
+    def assertNoTrigger(self, decision):
+        self.assertEqual((decision.trusted, decision.issue, decision.kind), (False, None, "none"), decision.reason)
+
+    def test_a_regate_from_this_repos_own_token_is_trusted_for_the_issue_and_its_stack(self):
+        self.gh_issue()
+        decision = t.decide("repository_dispatch", self.regate(), REPO, env=self.env)
+        self.assertEqual((decision.trusted, decision.issue, decision.kind), (True, 7, "regate"), decision.reason)
+        self.assertEqual(t.resolve("repository_dispatch", self.regate(), REPO), (7, "github-actions[bot]", "regate"))
+
+    def test_the_pin_must_be_the_pin_of_the_issue_now(self):
+        # The land job carried round 0's pin; if the issue was edited since, the re-gate must not replay the stack (F2b).
+        self.gh_issue(body="Edited after the stack was sealed.\n")
+        decision = t.decide("repository_dispatch", self.regate(), REPO, env=self.env)
+        self.assertEqual((decision.trusted, decision.kind), (False, "none"))
+        self.assertIn("pin", decision.reason)
+        # A changed pin field of the payload is the same refusal, not a different text.
+        self.gh_issue()
+        self.assertNoTrigger(t.decide("repository_dispatch", self.regate(pin="d" * 64), REPO, env=self.env))
+
+    def test_an_issue_that_cannot_be_read_is_refused(self):
+        self.bins.add("gh", stderr="HTTP 404\n", code=1)
+        decision = t.decide("repository_dispatch", self.regate(), REPO, env=self.env)
+        self.assertEqual((decision.trusted, decision.kind), (False, "none"))
+        self.assertIn("pin", decision.reason)
+
+    def test_only_this_repos_own_token_may_send_a_regate(self):
+        # A writer's login is not enough: the token is the proof, so no permission lookup is made for a re-gate.
+        log = self.root / "calls.jsonl"
+        self.bins.add("gh", stdout=json.dumps({"permission": "admin"}), log=log)
+        for sender, sender_type in (("alice", "User"), ("maintainer", "User"), ("github-actions[bot]", "User"),
+                                    ("someone/fork", "Bot"), ("", "Bot")):
+            with self.subTest(sender=sender, sender_type=sender_type):
+                decision = t.decide("repository_dispatch", self.regate(sender=sender, sender_type=sender_type), REPO, env=self.env)
+                self.assertEqual((decision.trusted, decision.kind), (False, "none"), decision.reason)
+                self.assertIn("own token", decision.reason)
+        self.assertFalse(log.exists(), "a regate decides on the sender, not on a permission lookup")
+        # The genuine sender is trusted (the control: the rule above is the sender, not the absence of a lookup).
+        self.gh_issue()
+        decision = t.decide("repository_dispatch", self.regate(), REPO, env=self.env)
+        self.assertEqual((decision.trusted, decision.issue, decision.kind), (True, 7, "regate"), decision.reason)
+
+    def test_a_regate_for_another_repository_or_without_fields_is_no_trigger(self):
+        self.gh_issue()
+        self.assertNoTrigger(t.decide("repository_dispatch", self.regate(repository="you/other"), REPO, env=self.env))
+        self.assertNoTrigger(t.decide("repository_dispatch", self.regate(), "", env=self.env))
+        for payload in ("not an object", None):
+            event = self.regate()
+            event["client_payload"] = payload
+            self.assertNoTrigger(t.decide("repository_dispatch", event, REPO, env=self.env))
+        no_payload = {k: v for k, v in self.regate().items() if k != "client_payload"}
+        self.assertNoTrigger(t.decide("repository_dispatch", no_payload, REPO, env=self.env))
+
+    def test_the_payload_is_held_to_the_reates_keys_and_shapes(self):
+        """F5: a malformed or missing field is a refusal, not a guess. Every case is kind none, so nothing starts."""
+        self.gh_issue()
+        cases = {
+            "an extra key": self.regate(findings="x"),
+            "pin not a digest": self.regate(pin="abc"),
+            "pin uppercase": self.regate(pin="A" * 64),
+            "pin not text": self.regate(pin=7),
+            "issue zero": self.regate(issue=0),
+            "issue bool": self.regate(issue=True),
+            "issue text": self.regate(issue="7"),
+            "sealed_sha short": self.regate(sealed="abc"),
+            "sealed_sha zero": self.regate(sealed="0" * 40),
+            "sealed_sha not text": self.regate(sealed=7),
+            "base_sha zero": self.regate(base="0" * 40),
+            "base_sha not text": self.regate(base=5),
+            "the stack branch of another issue": self.regate(branch="pivotal/issue-8/stack"),
+            "the draft branch of the slice": self.regate(branch="pivotal/issue-7/one"),
+            "the default branch": self.regate(branch="main"),
+            "a traversal branch": self.regate(branch="pivotal/issue-7/../stack"),
+            "a branch of another root": self.regate(branch="pivotal/issue-7/stack/extra"),
+            "branch not text": self.regate(branch=7),
+        }
+        for name, event in cases.items():
+            with self.subTest(case=name):
+                self.assertNoTrigger(t.decide("repository_dispatch", event, REPO, env=self.env))
+                self.assertEqual(t.resolve("repository_dispatch", event, REPO)[2], "none", name)
+        fewer = self.regate()["client_payload"]
+        for key in t.REGATE_KEYS:
+            with self.subTest(missing=key):
+                payload = {k: v for k, v in fewer.items() if k != key}
+                event = {**self.regate(), "client_payload": payload}
+                self.assertNoTrigger(t.decide("repository_dispatch", event, REPO, env=self.env))
+
+    def test_the_payload_problem_names_the_rule_it_breaks(self):
+        self.assertEqual(t.regate_payload_problem(self.regate()), "")
+        self.assertIn("branch", t.regate_payload_problem(self.regate(branch="main")))
+        self.assertIn("pin", t.regate_payload_problem(self.regate(pin="abc")))
+
+    def test_regate_pin_covers_every_field_and_the_factory_checks_it_again(self):
+        """The pin the factory compares with its own digest (job.check_pin): it moves with every field, so a payload changed
+        after trust decided never starts a re-gate."""
+        event = self.regate()
+        self.assertEqual(t.regate_pin(event), t.regate_pin(self.regate()))
+        digest = t.regate_pin(event)
+        self.assertEqual(digest, hashlib.sha256(json.dumps([7, ISSUE_PIN, "pivotal/issue-7/stack", self.SEALED, self.BASE])
+                                                .encode("ascii")).hexdigest())
+        for name, value in (("issue", 8), ("pin", "e" * 64), ("branch", "pivotal/issue-7/one"), ("sealed_sha", "f" * 40),
+                            ("base_sha", "1" * 40)):
+            with self.subTest(field=name):
+                other = self.regate()
+                other["client_payload"][name] = value
+                self.assertNotEqual(t.regate_pin(other), digest)
+        self.assertEqual(t.regate_pin({"client_payload": {}}), "")
+        self.assertEqual(t.regate_pin({}), "")
+
+    def test_another_action_or_another_event_is_no_regate(self):
+        self.gh_issue()
+        self.assertNoTrigger(t.decide("repository_dispatch", self.regate(action="pivotal-fix"), REPO, env=self.env))
+        # A pivotal-event of the same shape is the event kind, decided by its sender (here: untrusted), never a regate.
+        event = t.decide("repository_dispatch", self.regate(action="pivotal-event"), REPO, env=self.env)
+        self.assertNotEqual((event.trusted, event.kind), (True, "regate"))
+        self.assertNoTrigger(t.decide("issues", self.regate(), REPO, env=self.env))
 
 
 class CommentEscalationTest(FakeGhTest):
@@ -716,6 +879,41 @@ class MainTest(FakeGhTest):
         self.assertEqual(code, 0)
         self.assertEqual(lines, ["trusted=true", "issue=", "kind=event", "pin="])
         self.assertTrue(err.startswith("trusted:"), err)
+
+    def test_a_regate_prints_the_issue_and_the_pin_it_carries(self):
+        """A re-gate has no issue object, so trust prints the payload's regate_pin (round 0's pin, branch, sealed and base).
+        The factory reads this as ISSUE_PIN and job.check_pin recomputes it, then compares the carried round-0 pin with the
+        live issue."""
+        self.bins.add_routed("gh", {"/issues/7": (issue_reply(), 0)})
+        code, lines, err = self.run_main("repository_dispatch", regate())
+        self.assertEqual(code, 0)
+        self.assertEqual(lines, ["trusted=true", "issue=7", "kind=regate", f"pin={t.regate_pin(regate())}"], err)
+        self.assertNotEqual(t.regate_pin(regate()), ISSUE_PIN)
+
+    def test_a_regate_printed_pin_round_trips_through_job_check_pin(self):
+        """The pin trust prints for a re-gate is job.check_pin's pin: it passes for the live issue and is refused when the
+        issue's title has been edited (round 0's carried pin no longer matches the live text)."""
+        from engine import job
+
+        self.bins.add_routed("gh", {"/issues/7": (issue_reply(), 0)})
+        code, lines, err = self.run_main("repository_dispatch", regate())
+        self.assertEqual(code, 0)
+        pin = lines[3][len("pin="):]
+
+        # The live issue: the printed pin passes job.check_pin.
+        job.check_pin("regate", pin, ISSUE_TITLE, ISSUE_BODY, dispatch=regate())
+
+        # An edited issue title: the carried round-0 pin no longer matches, so it is refused.
+        with self.assertRaises(job.JobError):
+            job.check_pin("regate", pin, "Ship the stack, edited", ISSUE_BODY, dispatch=regate())
+
+
+    def test_a_regate_that_is_refused_prints_no_pin_and_says_why(self):
+        self.bins.add("gh", stderr="HTTP 404\n", code=1)
+        code, lines, err = self.run_main("repository_dispatch", regate())
+        self.assertEqual(code, 0)
+        self.assertEqual(lines, ["trusted=false", "issue=", "kind=none", "pin="], err)
+        self.assertIn("pin", err)
 
     def test_a_fork_pr_run_prints_no_trigger(self):
         self.gh_permission("admin")

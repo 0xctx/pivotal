@@ -461,7 +461,7 @@ class CallerTest(unittest.TestCase):
         )
         self.assertEqual(on["issues"]["types"], ["labeled"])
         self.assertEqual(on["issue_comment"]["types"], ["created"])
-        self.assertEqual(on["repository_dispatch"]["types"], ["pivotal-event", "pivotal-fix"])
+        self.assertEqual(on["repository_dispatch"]["types"], ["pivotal-event", "pivotal-fix", "pivotal-regate"])
         self.assertEqual(on["workflow_run"]["types"], ["completed"])
         self.assertTrue(on["workflow_run"]["workflows"], "workflow_run names no CI workflow")
 
@@ -544,12 +544,23 @@ class CallerTest(unittest.TestCase):
             with self.subTest(job=job_id):
                 self.assertIsInstance(self.jobs[job_id]["secrets"], dict)
 
-    def test_factory_trusted_runs_on_the_trusted_go_fix_event_and_incident_kinds(self):
+    def test_factory_trusted_runs_on_the_trusted_go_fix_regate_event_and_incident_kinds(self):
+        # A re-gate is trusted and runs the factory's plan path (which replays the stack, never builds it again).
         self.assertEqual(
             self.jobs["factory-trusted"]["if"],
             "needs.trust.outputs.trusted == 'true' && "
-            "contains(fromJSON('[\"go\",\"fix\",\"event\",\"incident\"]'), needs.trust.outputs.kind)",
+            "contains(fromJSON('[\"go\",\"fix\",\"regate\",\"event\",\"incident\"]'), needs.trust.outputs.kind)",
         )
+
+    def test_every_event_type_the_caller_accepts_is_one_trust_knows(self):
+        """A repository_dispatch type the caller lists but trust does not resolve would start a run that trust turns away:
+        every listed type is a type engine/trust.py resolves to a kind, and the regate is the one that reaches the plan path."""
+        listed = self.doc["on"]["repository_dispatch"]["types"]
+        for event_type in listed:
+            with self.subTest(event_type=event_type):
+                self.assertIn(event_type, (trust.EVENT_TYPE, trust.FIX_EVENT, trust.REGATE_EVENT))
+        self.assertEqual(trust.REGATE_EVENT, "pivotal-regate")
+        self.assertIn("regate", trust.KINDS)
 
     def test_factory_untrusted_runs_only_for_an_untrusted_go(self):
         self.assertEqual(

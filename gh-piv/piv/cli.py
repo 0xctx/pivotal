@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import control, demo, do, doctor, event, init, presetcheck, remove, runner, serve, status, var
+from . import control, demo, do, doctor, event, init, presetcheck, remove, runner, serve, status, upgrade, var
 from .gh import Gh, PivError
 
 # The repo root: this file is gh-piv/piv/cli.py, so presets/, engine/ and kaggle/ are two levels up.
@@ -40,6 +40,20 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--release", help="a tag or commit of 0xctx/pivotal to pin the caller to (default: its latest release)")
     setup.add_argument("--engine", metavar="OWNER/REPO", help="the engine repo to pin the caller to (default: 0xctx/pivotal)")
     setup.add_argument("--update", action="store_true", help="replace the caller file if it differs from the release's")
+    upgrade_cmd = commands.add_parser(
+        "upgrade",
+        help="move callers to one engine release: REPO, or --owner OWNER for every repo with the pivotal topic",
+    )
+    upgrade_cmd.add_argument(
+        "repo", nargs="?", metavar="REPO",
+        help="owner/name, for example 0xctx/piv-sandbox (or --owner for every repo you manage)",
+    )
+    upgrade_cmd.add_argument(
+        "--owner", metavar="OWNER", help="move every repo of OWNER that has the pivotal topic (the search can lag)"
+    )
+    upgrade_cmd.add_argument(
+        "--release", help="a tag or commit of 0xctx/pivotal to pin the callers to (default: its latest release)"
+    )
     demo_cmd = commands.add_parser(
         "demo", help="make the public sandbox repo, file its three issues and print their run links (--clean deletes it)"
     )
@@ -222,6 +236,8 @@ def main(
                 engine=args.engine,
             )
             init.init(req, gh, env, say)
+        elif args.command == "upgrade":
+            return upgrade.upgrade(upgrade.managed(args.repo, args.owner, gh), args.release, gh, say)
         elif args.command == "do":
             req = do.request(
                 args.repo,

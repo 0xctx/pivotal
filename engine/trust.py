@@ -14,8 +14,8 @@ command is then decided by the issue's author, unless the first line is ``/pivot
 (F2b).
 
 ``resolve`` maps the event to an issue, the actor whose permission decides, and a kind. ``main``
-prints the job outputs: trusted, issue, kind and pin (``issue_pin``, or ``fix_pin`` for a dispatch). An empty pin means
-the factory refuses.
+prints the job outputs: trusted, issue, kind and pin (``issue_pin``, ``fix_pin`` for a fix dispatch, or
+``regate_pin`` for a re-gate dispatch). An empty pin means the factory refuses.
 
 An incident (T5) is a ``workflow_run`` of this repository's CI that failed on a push to its default branch: the same
 repository, the default branch and ``conclusion == failure`` (a fork PR named after the branch triggers nothing). Its actor is
@@ -31,6 +31,13 @@ any other sender must be a login whose permission is admin, maintain or write (t
 also name this repository and carry a complete, well-formed payload (``fix_pin`` is not empty and ``fix_payload_problem``
 finds nothing), or it is not a trigger. The round bound (``round > max_rounds``) is plan's refusal, which runs before any
 secret is used. publish sends the event only for a trusted run, so a stranger's issue cannot start a trusted fix.
+
+A ``pivotal-regate`` ``repository_dispatch`` is the land job's re-gate (T5, engine/land.py): the base moved after the stack was
+sealed, and the land job asks for the stack to be replayed on the new base. It is trusted only when this repository's own
+``GITHUB_TOKEN`` sent it (no job of a fork or a stranger has it), and its payload must be exactly the re-gate's keys, with the
+stack branch ``pivotal/issue-<n>/stack`` of the issue it names (``regate_payload_problem``: a payload can never name another
+branch), and with a pin that is the pin of the issue text NOW (``_regate`` reads the issue and compares). The kind is
+``regate``, which never starts a build: the run replays the stack (plan's path), it does not rebuild the issue's request.
 
 Nothing reads the environment except ``__main__``, and ``main`` takes it as an argument, so tests
 pass their own PATH.
@@ -50,10 +57,12 @@ TRUSTED = frozenset({"admin", "maintain", "write"})
 # Levels a log line may name. Any other answer is logged as "unknown" (the answer is untrusted text).
 KNOWN_PERMISSIONS = frozenset({"admin", "maintain", "write", "triage", "read", "none"})
 # Every kind a trigger can resolve to. event and incident have no issue yet: ack files it (T5).
-KINDS = frozenset({"go", "fix", "land", "stop", "event", "incident", "none"})
+KINDS = frozenset({"go", "fix", "land", "stop", "event", "incident", "regate", "none"})
 NO_ISSUE_KINDS = frozenset({"event", "incident"})
 # The repository_dispatch action of an event, as piv event sends it (templates/caller.yml listens for it).
 EVENT_TYPE = "pivotal-event"
+# The repository_dispatch action of the land job's re-gate (engine/land.py, engine/fix.py REGATE_EVENT).
+REGATE_EVENT = "pivotal-regate"
 # The workflow_run of a CI failure: the one event an incident comes from (T5).
 INCIDENT_EVENT = "workflow_run"
 TIMEOUT_SECONDS = 20
@@ -68,6 +77,10 @@ LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 # The sender of a dispatch made with the workflow's own GITHUB_TOKEN (the publish job's fix rounds).
 OWN_TOKEN_SENDER = ("github-actions[bot]", "Bot")
 FIX_EVENT = "pivotal-fix"
+# The last part of a stack branch (``pivotal/issue-<n>/stack``, engine/assemble.py ``stack_branch``): the one branch a re-gate
+# may name, and only for the issue it names. assemble imports trust, so the rule is repeated here and test_trust holds the two
+# constants together.
+STACK = "stack"
 BRANCH_OF = re.compile(r"pivotal/issue-([1-9][0-9]{0,9})/([a-z0-9][a-z0-9-]{0,39})")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA64 = re.compile(r"[0-9a-f]{64}")
@@ -237,6 +250,12 @@ def _trigger(event_name: str, payload: Mapping, repo: str = "") -> tuple[int | N
         if fix_payload_problem(payload):
             return nothing
         return issue, _dig(payload, "sender", "login"), "fix"
+    if event_name == "repository_dispatch" and action == REGATE_EVENT:
+        fields = _dig(payload, "client_payload")
+        issue = _number(_dig(fields, "issue")) if isinstance(fields, Mapping) else None
+        if regate_payload_problem(payload):
+            return nothing
+        return issue, _dig(payload, "sender", "login"), "regate"
     if event_name == "repository_dispatch" and action == EVENT_TYPE and not dispatch_problem(payload, repo):
         return None, _dig(payload, "sender", "login"), "event"
     if event_name == INCIDENT_EVENT and not workflow_run_problem(payload, repo):
@@ -264,6 +283,51 @@ def fix_payload_problem(payload: Mapping) -> str:
     if not isinstance(fields.get("findings"), str):  # present and text: a payload without it is not one this engine sent
         return "findings is missing or is not text"
     return ""
+
+
+def regate_payload_problem(payload: Mapping) -> str:
+    """"" when the dispatch event is a well-formed re-gate of one issue's own stack branch, else the rule it breaks.
+
+    A re-gate is the land job's dispatch after the base moved under a sealed stack (engine/land.py): it names the issue, round
+    0's pin of the issue text, the issue's own stack branch ``pivotal/issue-<n>/stack`` and the sealed commit with the base it was
+    gated on. The branch rule is the whole of it: a payload can never name a branch other than the stack branch of the issue it
+    names, so a re-gate can never build or replay anything but that stack. The pin is checked against the live issue by ``_regate``,
+    not here: this function reads the event alone."""
+    fields = _dig(payload, "client_payload")
+    if not isinstance(fields, Mapping):
+        return "the re-gate payload has no fields"
+    if set(fields) != set(REGATE_KEYS):
+        return "the re-gate payload has a key that is not one of ours, or lacks one"
+    if _number(fields["issue"]) is None:
+        return "the re-gate payload has no issue number"
+    if not all(isinstance(fields[name], str) for name in REGATE_KEYS[1:]):
+        return "the re-gate payload has a field that is not text"
+    if SHA64.fullmatch(fields["pin"]) is None:
+        return "the re-gate payload's pin is not a sha256 digest"
+    found = BRANCH_OF.fullmatch(fields["branch"])
+    if found is None or int(found[1]) != fields["issue"] or found[2] != STACK:
+        return "the branch is not the stack branch of the issue the re-gate names"
+    for name in ("sealed_sha", "base_sha"):
+        # The all-zero placeholder is not a commit (assemble's land.json refuses it too): a re-gate never names it.
+        if SHA40.fullmatch(fields[name]) is None or fields[name] == "0" * 40:
+            return f"{name} is not a commit SHA"
+    return ""
+
+
+def regate_pin(payload: Mapping) -> str:
+    """The pin of a ``pivotal-regate`` dispatch, which carries no issue object: sha256 of the JSON array
+    [issue, pin, branch, sealed_sha, base_sha] taken from ``client_payload``, or "" if any is unreadable.
+
+    The factory computes it again from the same event (job.check_pin) and refuses on a mismatch, so a payload changed after trust
+    decided never starts a re-gate. The payload's own ``pin`` (round 0's pin of the issue text) is part of it, so it is covered
+    twice: by this digest and by the live issue's own pin (``_regate``)."""
+    fields = _dig(payload, "client_payload")
+    if not isinstance(fields, Mapping):
+        return ""
+    values = [fields.get(name) for name in REGATE_KEYS]
+    if _number(values[0]) is None or not all(isinstance(v, str) and v for v in values[1:]):
+        return ""
+    return hashlib.sha256(json.dumps(values).encode("ascii")).hexdigest()
 
 
 def _is_command_on_pull_request(kind: str, payload: object) -> bool:
@@ -326,6 +390,8 @@ def decide(
         return _refused("invalid repository")
     if kind in NO_ISSUE_KINDS:
         return _no_issue(event_name, payload, repo, kind, actor, env, timeout)
+    if event_name == "repository_dispatch" and kind == "regate":
+        return _regate(payload, repo, issue, env, timeout)
     if event_name == "repository_dispatch" and issue is not None:
         return _dispatch(payload, repo, issue, "fix", env, timeout)
     if not _valid_login(actor):
@@ -368,6 +434,33 @@ def decide(
         return Decision(False, issue, kind, f"{verdict.reason}; the stack lands through a /pivotal land comment on its pull request")
     rerun = f"a writer can re-run it with {EXPLICIT_TRUST}"
     return Decision(False, issue, kind, f"{verdict.reason}; {rerun}")
+
+
+def _read_issue(repo: str, number: int | None, env: Mapping[str, str] | None, timeout: float) -> Mapping:
+    """The issue as the API answers it, or {} when it cannot be read (``issues: read``). Its text is untrusted: the one caller
+    hashes it (the pin), it never acts on it."""
+    if not _valid_repo(repo) or _number(number) is None:
+        return {}
+    data = _api(f"repos/{repo}/issues/{number}", env=env, timeout=timeout)
+    return data if isinstance(data, Mapping) else {}
+
+
+def _regate(payload: Mapping, repo: str, issue: int | None, env: Mapping[str, str] | None, timeout: float) -> Decision:
+    """Trust for a re-gate dispatch (kind ``regate``): this repository's own token, this repository, a payload of the re-gate's
+    shape, and the pin of the issue text as it is NOW. The land job read that text when it sealed the stack; a re-gate whose pin is
+    not the live issue's is refused, so an edited issue never replays a stack its owner has not seen (F2b)."""
+    if dispatch_problem(payload, repo):
+        return _refused("the dispatch names another repository or has no fields")
+    if (_dig(payload, "sender", "login"), _dig(payload, "sender", "type")) != OWN_TOKEN_SENDER:
+        return _refused("a re-gate is trusted only when this repository's own token sent it")
+    problem = regate_payload_problem(payload)
+    if problem:
+        return _refused(f"the re-gate payload is not one of ours: {problem}")
+    pin = _dig(payload, "client_payload", "pin")
+    live = issue_pin({"issue": _read_issue(repo, issue, env, timeout)})
+    if not live or live != pin:
+        return _refused("the re-gate's pin is not the pin of the issue now: the issue changed after the stack was sealed")
+    return Decision(True, issue, "regate", "the repository's own token asks for a re-gate of the issue's stack")
 
 
 def _no_trigger_reason(event_name: str, payload: Mapping, repo: str) -> str:
@@ -439,6 +532,9 @@ def issue_pin(payload: Mapping) -> str:
 # engine/hill.py) is pinned: it decides which head the round builds from.
 PAYLOAD_KEYS = ("issue", "slice", "round", "run_id", "branch", "head_sha", "issue_pin", "scores", "findings")
 FIX_PIN_FIELDS = PAYLOAD_KEYS[:-1]  # derived, never a second list (R24)
+# The keys of a pivotal-regate client_payload, in order (fix.REGATE_KEYS is this tuple). All of them are pinned by `regate_pin`:
+# a re-gate carries no text the factory acts on as an instruction, so there is nothing like `findings` to leave out.
+REGATE_KEYS = ("issue", "pin", "branch", "sealed_sha", "base_sha")
 
 
 def fix_pin(payload: Mapping) -> str:
@@ -471,6 +567,11 @@ def main(env: Mapping[str, str], stdout: TextIO = sys.stdout, stderr: TextIO = s
             pin = issue_pin(payload)
             if decision.kind == "fix" and env.get("GITHUB_EVENT_NAME") == "repository_dispatch":
                 pin = fix_pin(payload)
+            elif decision.kind == "regate":
+                # A re-gate carries no issue object: its pin is the digest the factory recomputes (regate_pin), covering
+                # the round-0 pin, branch, sealed and base. job.check_pin recomputes it and compares the carried round-0
+                # pin with the live issue, so an edited issue is still refused.
+                pin = regate_pin(payload)
     except Exception as exc:  # an unexpected failure still prints the fail-closed outputs (F2b)
         decision = _refused(f"internal error ({type(exc).__name__})")
     print(f"trusted={'true' if decision.trusted else 'false'}", file=stdout)

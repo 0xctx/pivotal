@@ -1,9 +1,12 @@
 """The docs line's gate commands: links, fences and spelling of the Markdown files.
 
-``python3 -I engine/doccheck.py [DIR]`` checks every ``*.md`` file under DIR (default: the current directory)
+``python3 -I engine/doccheck.py [DIR]`` checks the Markdown files of DIR (default: the current directory)
 and prints one ``path:line: message`` per problem, then exits 1. It exits 0 when nothing is wrong and 2 for a
 bad call. The gate runs it after the repo's own check (``engine/lines.py`` GATES["docs"]).
 
+- Files: the tracked Markdown files of a git checkout (``git ls-files -z -- '*.md'``, as paths under DIR), and the walk of
+  the tree when DIR is not in a git checkout. The gate means the published docs are true, so an untracked scratch file
+  (the operator's ``.sysop`` store in a local checkout) is not a doc and does not fail it; a clean CI checkout has none.
 - Links: a relative ``[text](target)`` or ``[label]: target`` must name a file or directory that exists under
   DIR. A ``#fragment`` and a ``?query`` are cut off first, and the fragment is not checked. A URL with a
   scheme, a bare ``#fragment``, a ``//host`` link and a link inside a code fence or an inline code span are
@@ -20,13 +23,17 @@ fails the check rather than passing unread.
 import os
 import re
 import stat
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 MAX_BYTES = 2 * 1024 * 1024
 MAX_FILES = 5000
-SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "__pycache__"})
+SKIP_DIRS = frozenset({".git", ".sysop", "node_modules", ".venv", "__pycache__"})
+GIT_LS_FILES = ("git", "ls-files", "-z", "--", "*.md")  # the tracked Markdown files, as paths relative to the cwd
+GIT_ENV_DROP = frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"})
+READ_CHUNK = 65536
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 INLINE = re.compile(r"`+[^`]*`+")
 LINK = re.compile(r"\[[^\]\n]*\]\(\s*<?([^)\s>]*)>?[^)\n]*\)")
@@ -48,12 +55,86 @@ MISSPELLED = {
 }
 
 
-def markdown_files(root: Path) -> Iterator[Path]:
+def walk_markdown(root: Path) -> Iterator[Path]:
+    """The ``*.md`` files under root by walking the tree: the fallback for a directory that is not in a git checkout."""
     for directory, names, files in os.walk(root, followlinks=False):
         names[:] = sorted(n for n in names if n not in SKIP_DIRS)
         for name in sorted(files):
             if name.lower().endswith(".md"):
                 yield Path(directory) / name
+
+
+def plain_path(root: Path, name: str) -> Path | None:
+    """A name ``git ls-files`` printed as a path under root, or None when it is not a plain relative path inside it.
+
+    The index is repo data, not a promise: an absolute name, an empty name or one that climbs out of the tree is
+    refused rather than read (F5), so the check never reads a file the tree does not hold.
+    """
+    if not name or os.path.isabs(name):
+        return None
+    local = os.path.normpath(name)
+    if local == os.pardir or local.startswith(os.pardir + os.sep):
+        return None
+    return root / local
+
+
+def tracked_markdown(root: Path, limit: int = MAX_FILES) -> list[Path] | None:
+    """The tracked Markdown files under root, from ``git ls-files``, or None when root is not in a git checkout.
+
+    At most ``limit + 1`` names are read and the child is killed past that, so a repository cannot make the check run
+    on without end; ``check`` then refuses with the same message a walk of too many files gets. A name that is not a
+    plain relative path inside root raises ValueError rather than being skipped.
+    """
+    try:
+        child = subprocess.Popen([*GIT_LS_FILES], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 env={name: value for name, value in os.environ.items() if name not in GIT_ENV_DROP})
+    except OSError:  # no git, or no directory to run it in: the walk below is the fallback
+        return None
+    found: list[Path] = []
+    tail = b""
+    stopped = ""  # the refusal of a name that is not a plain path, or ""
+    full = False  # more names than the limit: the child is killed and the caller refuses
+    try:
+        while not stopped and not full:
+            chunk = child.stdout.read(READ_CHUNK)
+            if not chunk:
+                break
+            tail += chunk
+            *whole, tail = tail.split(b"\0")
+            for raw in whole:
+                path = plain_path(root, os.fsdecode(raw))
+                if path is None:
+                    stopped = f"a tracked name is not a plain path inside the tree: {raw!r}"
+                    break
+                if path.name.lower().endswith(".md"):
+                    found.append(path)
+                    if len(found) > limit:
+                        full = True
+                        break
+    finally:
+        if stopped or full:
+            child.kill()
+        status = child.wait()
+        child.stdout.close()
+    if not stopped and not full and tail:  # git ends every name with NUL; a last name without one is a truncated answer
+        stopped = f"a tracked name is not terminated: {tail[:200]!r}"
+    if stopped:
+        raise ValueError(stopped)
+    if status != 0 and not full:
+        return None  # git failed: not a repository, an unreadable index. The walk below is the fallback.
+    return found
+
+
+def markdown_files(root: Path) -> Iterator[Path]:
+    """The Markdown files of root: the tracked ones in a git checkout, else the walk of the tree.
+
+    Raises ValueError when the index names a path that is not a plain relative path inside root.
+    """
+    tracked = tracked_markdown(root)
+    if tracked is not None:
+        yield from tracked
+        return
+    yield from walk_markdown(root)
 
 
 def read_text(path: Path) -> str | None:
@@ -126,23 +207,27 @@ def bad_link(target: str, path: Path, root: Path) -> str:
 def check(root: Path, out) -> int:
     root = Path(os.path.normpath(root.resolve()))
     count = bad = 0
-    for path in markdown_files(root):
-        count += 1
-        if count > MAX_FILES:
-            print(f"more than {MAX_FILES} Markdown files: not checked", file=out)
-            return 1
-        shown = path.relative_to(root)
-        try:
-            text = read_text(path)
-        except ValueError as err:
-            print(f"{shown}: {err}", file=out)
-            bad += 1
-            continue
-        if text is None:
-            continue
-        for problem in check_text(text, path, root):
-            print(f"{shown}:{problem}", file=out)
-            bad += 1
+    try:
+        for path in markdown_files(root):
+            count += 1
+            if count > MAX_FILES:
+                print(f"more than {MAX_FILES} Markdown files: not checked", file=out)
+                return 1
+            shown = path.relative_to(root)
+            try:
+                text = read_text(path)
+            except ValueError as err:
+                print(f"{shown}: {err}", file=out)
+                bad += 1
+                continue
+            if text is None:
+                continue
+            for problem in check_text(text, path, root):
+                print(f"{shown}:{problem}", file=out)
+                bad += 1
+    except ValueError as err:  # the index named a path that is not inside the tree
+        print(f"doccheck: {err}", file=out)
+        return 1
     print(f"doccheck: {count} Markdown file{'' if count == 1 else 's'}, {bad} problem{'' if bad == 1 else 's'}", file=out)
     return 1 if bad else 0
 

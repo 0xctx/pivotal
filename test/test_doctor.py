@@ -32,6 +32,7 @@ ZEROS = "0" * 40
 REPO = "0xctx/piv-sandbox"
 OWNER = "0xctx"
 PINNED_CALLER = CALLER.replace(init.ENGINE_PLACEHOLDER, init.ENGINE_REPO).replace(ZEROS, SHA)
+RELEASE = "v1.0.0"  # the release the healthy() caller is pinned to
 LAUNCHER = ROOT / "gh-piv" / "gh-piv"
 WORKFLOW = ".github/workflows/pivotal.yml"
 SEARCH = f"search/repositories?q=topic%3Apivotal+user%3A{OWNER}"
@@ -144,6 +145,10 @@ class DoctorTest(unittest.TestCase):
             f"api repos/{repo}/actions/variables/PIVOTAL_LEVEL": [ok_json({"value": "prepare"})],
             f"api repos/{repo}/actions/variables/PIVOTAL_CHECK": [ok_json({"value": "make test"})],
             f"api repos/{repo}/actions/runners": [ok_json({"total_count": 0, "runners": []})],
+            f"api repos/{init.ENGINE_REPO}/releases": [
+                ok_json([{"tag_name": RELEASE, "draft": False, "prerelease": False}])
+            ],
+            f"api repos/{init.ENGINE_REPO}/commits/{RELEASE}": [ok_json({"sha": SHA})],
             f"api users/{OWNER}/settings/billing/actions": [
                 ok_json({"included_minutes": 2000, "total_minutes_used": 10})
             ],
@@ -282,10 +287,91 @@ class CallerTest(DoctorTest):
     def test_a_caller_for_a_fork_is_ok_and_says_a_fork(self):
         fork = "a/b"
         text = init.render_caller(CALLER, SHA, fork)
-        self.healthy(**{f"api repos/{REPO}/contents/{WORKFLOW}": [contents(text)]})
+        self.healthy(**{
+            f"api repos/{REPO}/contents/{WORKFLOW}": [contents(text)],
+            f"api repos/{fork}/releases": [ok_json([{"tag_name": RELEASE, "draft": False, "prerelease": False}])],
+            f"api repos/{fork}/commits/{RELEASE}": [ok_json({"sha": SHA})],
+        })
         self.assertEqual(self.doctor(REPO), UNREAD, self.text())
         self.assertIn(f"engine: {fork} pinned to {SHA[:12]}", self.out.getvalue())
         self.assertIn("a fork", self.out.getvalue())
+
+
+class PinTest(DoctorTest):
+    """The pin line: the caller's commit against the engine's releases (current, behind, not a release, unreadable)."""
+
+    OTHER = "abcdef0123456789abcdef0123456789abcdef01"  # 40 hex, none of the releases
+    OLD = "1" * 40
+    NEW = "2" * 40
+
+    def routes(self, *pins: tuple[str, str], failure: dict | None = None) -> dict:
+        """Routes for the engine's releases: each (tag, commit sha), newest first."""
+        listed = [{"tag_name": tag, "draft": False, "prerelease": False} for tag, _ in pins]
+        routes = {f"api repos/{init.ENGINE_REPO}/releases": [failure or ok_json(listed)]}
+        for tag, sha in pins:
+            routes[f"api repos/{init.ENGINE_REPO}/commits/{tag}"] = [ok_json({"sha": sha})]
+        return routes
+
+    def test_a_pin_at_the_latest_release_is_ok(self):  # mutant: compare the tag text instead of the commit sha
+        self.healthy()
+        self.assertEqual(self.doctor(REPO), UNREAD, self.text())
+        self.assertEqual(problem_lines(self.out.getvalue()), [])
+        self.assertIn(f"[ok] pin: {SHA[:12]} (release {RELEASE})", self.out.getvalue())
+
+    def test_a_pin_at_an_older_release_is_a_problem_naming_the_latest_and_the_fix(self):  # mutant: always ok
+        caller = PINNED_CALLER.replace(SHA, self.OLD)
+        self.healthy(**{
+            f"api repos/{REPO}/contents/{WORKFLOW}": [contents(caller)],
+            **self.routes(("v1.1.0", self.NEW), ("v1.0.0", self.OLD)),
+        })
+        self.assertEqual(self.doctor(REPO), 1, self.text())
+        self.assertIn(
+            f"[problem] pin: {self.OLD[:12]} (behind: latest is v1.1.0 at {self.NEW[:12]}; run piv upgrade {REPO})",
+            self.out.getvalue(),
+        )
+        fixes = fix_lines(self.out.getvalue())
+        self.assertEqual(len(fixes), 1)
+        self.assertIn(f"gh piv upgrade {REPO}", fixes[0])
+
+    def test_a_pin_that_is_no_release_commit_is_a_problem(self):  # mutant: a non-release pin is skipped
+        caller = PINNED_CALLER.replace(SHA, self.OTHER)
+        self.healthy(**{
+            f"api repos/{REPO}/contents/{WORKFLOW}": [contents(caller)],
+            **self.routes((RELEASE, SHA)),
+        })
+        self.assertEqual(self.doctor(REPO), 1, self.text())
+        self.assertIn(f"[problem] pin: {self.OTHER[:12]} (not a release commit)", self.out.getvalue())
+        self.assertEqual(len(fix_lines(self.out.getvalue())), 1)
+
+    def test_an_unreadable_release_list_is_unknown_not_a_problem(self):  # mutant: a read failure is a problem
+        self.healthy(**self.routes(failure=fakegh.fail("gh: Server Error (HTTP 500)\n")))
+        self.assertEqual(self.doctor(REPO), UNREAD, self.text())
+        self.assertIn(
+            f"[unknown] pin: the releases of {init.ENGINE_REPO} could not be read (HTTP 500)",
+            self.out.getvalue(),
+        )
+        self.assertEqual(problem_lines(self.out.getvalue()), [])
+
+    def test_a_draft_or_a_prerelease_is_not_the_latest(self):  # mutant: a draft or a prerelease counts as a release
+        listed = [
+            {"tag_name": "v2.0.0", "draft": False, "prerelease": True},
+            {"tag_name": "v1.1.0", "draft": True, "prerelease": False},
+            {"tag_name": RELEASE, "draft": False, "prerelease": False},
+        ]
+        routes = {f"api repos/{init.ENGINE_REPO}/releases": [ok_json(listed)]}
+        for tag, sha in (("v2.0.0", self.NEW), ("v1.1.0", self.OLD), (RELEASE, SHA)):
+            routes[f"api repos/{init.ENGINE_REPO}/commits/{tag}"] = [ok_json({"sha": sha})]
+        self.healthy(**routes)
+        self.assertEqual(self.doctor(REPO), UNREAD, self.text())
+        self.assertIn(f"[ok] pin: {SHA[:12]} (release {RELEASE})", self.out.getvalue())
+
+    def test_an_engine_with_no_release_is_unknown_not_a_pass(self):  # mutant: no releases means the pin is ok
+        self.healthy(**self.routes())
+        self.assertEqual(self.doctor(REPO), UNREAD, self.text())
+        self.assertIn(
+            f"[unknown] pin: {init.ENGINE_REPO} has no release, so the pin is not compared", self.out.getvalue()
+        )
+        self.assertEqual(problem_lines(self.out.getvalue()), [])
 
 
 class ClaudeProbeTest(DoctorTest):
@@ -641,6 +727,16 @@ class AllReposTest(DoctorTest):
         self.gh.route(f"api {SEARCH}", ok_json({"total_count": 0, "items": []}))
         self.assertEqual(self.doctor("--all"), UNREAD, self.text())
         self.assertIn("no repo carries the pivotal topic", self.out.getvalue())
+
+    def test_all_reads_the_engine_release_list_once_for_every_repo(self):  # mutant: the list is read per repo
+        self.healthy(self.SECOND)
+        self.healthy(REPO)
+        found = [{"full_name": REPO}, {"full_name": self.SECOND}]
+        self.gh.route(f"api {SEARCH}", ok_json({"total_count": 2, "items": found}))
+        self.gh.route("api user", ok_json({"login": OWNER}))
+        self.assertEqual(self.doctor("--all"), UNREAD, self.text())
+        reads = [call for call in self.gh_calls() if "releases" in " ".join(call["args"])]
+        self.assertEqual(len(reads), 1, reads)
 
     def test_all_over_healthy_repos_exits_unread_not_clean(self):
         self.healthy(self.SECOND)

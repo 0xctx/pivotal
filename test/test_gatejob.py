@@ -113,7 +113,7 @@ class GateCase(unittest.TestCase):
     def write_land(self, **over) -> None:
         bundle = (self.land_dir / assemble.BUNDLE).read_bytes()
         land = {
-            "version": 2, "issue": ISSUE, "base_sha": self.base, "baseline": "green",
+            "version": assemble.LAND_VERSION, "issue": ISSUE, "base_sha": self.base, "baseline": "green", "issue_pin": "",
             "bundle": {"name": assemble.BUNDLE, "sha256": hashlib.sha256(bundle).hexdigest(), "bytes": len(bundle)},
             "has_stack": True, "positions": [s["id"] for s in self.slices], "slices": self.slices,
         }
@@ -746,7 +746,9 @@ class TargetRefusalTest(GateCase):
 
     def test_a_land_json_with_duplicate_keys_or_the_wrong_schema_is_refused(self):
         path = self.land_dir / assemble.LAND
-        for text in (path.read_text(encoding="utf-8").replace('"version": 2,', '"version": 2, "version": 2,'),
+        version = f'"version": {assemble.LAND_VERSION},'
+        doubled = path.read_text(encoding="utf-8").replace(version, f'{version} "version": {assemble.LAND_VERSION},')
+        for text in (doubled,
                      '{"version": 1}', "[]", "not json", "[" * 5000):
             with self.subTest(text=text[:30]):
                 path.write_bytes(text.encode())

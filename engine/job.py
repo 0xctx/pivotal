@@ -66,9 +66,12 @@ from engine import hill, trust  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 GH_TIMEOUT_SECONDS = 30
 ROOT_LINK = "https://github.com/"
-# The kinds the factory runs for. land and stop never reach it.
-KINDS = ("go", "fix", "event", "incident")
-PIN_KINDS = ("go", "fix")
+# The kinds the factory runs for. land and stop never reach it. ``regate`` is the land job's re-gate after a moved base
+# (engine/land.py): its run replays the sealed stack on the new base (plan's path), it never builds the issue's request again.
+KINDS = ("go", "fix", "event", "incident", "regate")
+# The kinds whose run is pinned to the issue's text: go and fix to its title and body, regate to round 0's pin of it (the
+# payload's, which trust compared with the live issue). event and incident have no issue yet.
+PIN_KINDS = ("go", "fix", "regate")
 PRESET_NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")
 # 40 hex digits, and not the all-zero placeholder an unedited caller carries.
 SHA = re.compile(r"(?!0{40})[0-9a-f]{40}")
@@ -76,6 +79,10 @@ SHA = re.compile(r"(?!0{40})[0-9a-f]{40}")
 LEVELS = ("watch", "ask", "prepare", "land")
 DEFAULT_LEVEL = "prepare"
 LEVEL_KINDS = {"watch": (), "ask": ("go", "fix"), "prepare": KINDS, "land": KINDS}
+# The kinds no level starts yet, so that a run of one is quiet everywhere (ack prints nothing, plan writes an empty matrix,
+# and no job after it does anything). ``regate`` is here until the replay of the sealed stack on the moved base is built
+# (land-regate-replay): a re-gate must never fall through to the build path and rebuild the issue's request.
+NOT_STARTED = frozenset({"regate"})
 
 # Each job output and the only value shape it may have. A newline matches none of them.
 MATRIX_MAX = 200000  # the longest matrix output, JSON in printable ASCII
@@ -165,7 +172,8 @@ def clean_text(text: object, fallback: str, limit: int = 60) -> str:
 
 
 def level_allows(level: str, kind: str) -> bool:
-    return kind in LEVEL_KINDS[level]
+    """Whether a level starts a run of this kind: ``NOT_STARTED`` kinds start none at any level (their run is quiet)."""
+    return kind not in NOT_STARTED and kind in LEVEL_KINDS[level]
 
 
 def lands(level: str, kind: str) -> bool:
@@ -396,34 +404,43 @@ def read_engine_sha(env: Mapping[str, str]) -> str:
 
 
 def read_dispatch(env: Mapping[str, str], kind: str) -> Mapping | None:
-    """The event of a ``pivotal-fix`` dispatch (a fix run from repository_dispatch), else None."""
-    if kind != "fix" or env.get("GITHUB_EVENT_NAME") != "repository_dispatch":
+    """The event of a dispatch run (a ``pivotal-fix`` fix round, or a ``pivotal-regate`` re-gate), else None."""
+    if kind not in ("fix", "regate") or env.get("GITHUB_EVENT_NAME") != "repository_dispatch":
         return None
     try:
         with open(env.get("GITHUB_EVENT_PATH", ""), encoding="utf-8") as fh:
             event = json.load(fh)
     except (OSError, ValueError):
-        raise JobError("the fix event file is missing or not JSON") from None
+        raise JobError("the dispatch event file is missing or not JSON") from None
     return event if isinstance(event, dict) else {}
 
 
 def check_pin(kind: str, pin: str, title: str, body: str, dispatch: Mapping | None = None) -> None:
-    """Refuse a go or fix whose issue is not the one trust pinned. Other kinds have no pin.
+    """Refuse a go, fix or regate whose issue is not the one trust pinned. Other kinds have no pin.
 
-    A fix from a dispatch has no issue object: its pin covers the payload's issue, slice, round, run_id, branch,
-    head_sha and issue_pin (``trust.fix_pin``), checked against the event the job sees, and the payload's ``issue_pin`` (round 0's
-    pin) must still be the pin of the live issue. Any other go or fix is pinned to the issue's title and body.
+    A fix or a re-gate from a dispatch has no issue object: a fix's pin covers the payload's issue, slice, round, run_id, branch,
+    head_sha and issue_pin (``trust.fix_pin``), a re-gate's its issue, pin, branch, sealed_sha and base_sha (``trust.regate_pin``),
+    checked against the event the job sees, and the payload's own round-0 pin (``issue_pin`` for a fix, ``pin`` for a re-gate) must
+    still be the pin of the live issue. Any other go or fix is pinned to the issue's title and body.
     """
     if kind not in PIN_KINDS:
         return
     if not pin:
         raise JobError("the pin is empty, so the issue or fix is not the one trust decided on")
     if dispatch is not None:
-        if trust.fix_pin(dispatch) != pin:
-            raise JobError("the fix payload differs from the one trust decided on")
-        # The payload carries round 0's issue pin: a fix run's goal is the issue's text, so the live text must still be the one
+        fields = dispatch.get("client_payload") if isinstance(dispatch, Mapping) else None
+        fields = fields if isinstance(fields, Mapping) else {}
+        if kind == "regate":
+            if trust.regate_pin(dispatch) != pin:
+                raise JobError("the re-gate payload differs from the one trust decided on")
+            carried = fields.get("pin")  # round 0's pin of the issue text
+        else:
+            if trust.fix_pin(dispatch) != pin:
+                raise JobError("the fix payload differs from the one trust decided on")
+            carried = fields.get("issue_pin")  # round 0's pin of the issue text
+        # The payload carries round 0's issue pin: a run's goal is the issue's text, so the live text must still be the one
         # trust decided on (F2b), however many rounds ago.
-        if trust.issue_pin({"issue": {"title": title, "body": body}}) != dispatch["client_payload"]["issue_pin"]:
+        if not isinstance(carried, str) or trust.issue_pin({"issue": {"title": title, "body": body}}) != carried:
             raise JobError("the issue changed after trust decided: label or comment on it again")
         return
     if trust.issue_pin({"issue": {"title": title, "body": body}}) != pin:

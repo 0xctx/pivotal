@@ -12,8 +12,11 @@ runs no repo code. ``baseline`` checks the repo out at the base, holds no token,
 and check only through ``run_gate`` of engine/run.sh, whose environment is stripped (F1).
 
 ``decide`` exits quietly when the level forbids the kind: empty ``matrix``, round 0, nothing read or
-checked out, and the later steps skip. Otherwise it refuses (non-zero, nothing written) on a bad kind,
-preset, pin or fix payload, then prints ``matrix``, ``round`` and ``kaggle_needed``. ``matrix`` is a JSON
+checked out, and the later steps skip. A ``regate`` (the land job's re-gate after a moved base) is such a
+kind at every level today: no level starts one until the replay of the sealed stack on the new base is
+built (land-regate-replay), so a re-gate never builds the issue's request again (``job.NOT_STARTED``).
+Otherwise it refuses (non-zero, nothing written) on a bad kind, preset, pin or fix payload, then prints
+``matrix``, ``round`` and ``kaggle_needed``. ``matrix`` is a JSON
 list of one slice, from ``request_slices``. A request whose title or goal is over its bound (TITLE_MAX,
 GOAL_MAX) is refused by name before any slice is made: ``plan_why`` is ``request_too_large`` in the job
 outputs and the job exits 1, so the report names that refusal instead of the generic ``plan_failed``. A

@@ -655,6 +655,41 @@ OTHER = 999
 class BaseTest(LandCase):
     """3. The base: moved since the seal means a re-gate, not a landing."""
 
+    def test_a_moved_base_with_a_carried_pin_dispatches_a_regate_and_the_job_stays_red(self):
+        """The land artifact carries round 0's pin (assemble's `issue_pin`), so a moved base sends a pivotal-regate dispatch of the
+        issue, that pin, the issue's own stack branch, the sealed sha and the base it was gated on. The job is still red: nothing
+        was landed, and the replay of the stack on the new base is the next slice (land-regate-replay)."""
+        self.world()
+        pin = "a" * 64
+        land = {**self.land, "issue_pin": pin}
+        raw = assemble.land_text(land)
+        (self.out / assemble.LAND).write_bytes(raw)
+        self.w["check_runs"] = [self.seal_run(summary=seal.summary(hashlib.sha256(raw).hexdigest(), land["positions"]))]
+        # The pin is the artifact's, never the live issue text (R16): the issue was edited after the stack was sealed.
+        self.w["issue"] = {"number": ISSUE, "state": "open", "title": "Edited after the seal", "body": "A new goal.\n"}
+        moved = self.move_main()
+        pushes, patch = self.spy_push()
+        with patch:
+            code, outputs, _, err = self.go()
+        self.assertEqual(pushes, [], "no push at all")
+        self.assertEqual(self.main_tip(), moved, "the base is where it moved to")
+        self.assertEqual((code, outputs), (1, {"land_outcome": "regate", "sealed_sha": self.sha}), err)
+        (sent,) = [c for c in self.lgh.calls() if c["args"][:4] == ["api", "--method", "POST", f"repos/{REPO}/dispatches"]]
+        path = sent["args"][sent["args"].index("--input") + 1]
+        body = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.assertEqual(body["event_type"], "pivotal-regate")
+        self.assertEqual(body["client_payload"], {"issue": ISSUE, "pin": pin, "branch": assemble.stack_branch(ISSUE),
+                                                 "sealed_sha": self.sha, "base_sha": self.land["base_sha"]})
+        # trust accepts exactly this payload for that issue, and refuses it for any other branch.
+        event = {"action": "pivotal-regate", "sender": {"login": "github-actions[bot]", "type": "Bot"},
+                 "repository": {"full_name": REPO}, "client_payload": body["client_payload"]}
+        self.assertEqual(trust.regate_payload_problem(event), "")
+        (text,) = self.bodies()
+        self.assertIn("re-gate was dispatched", text)
+        self.assertIn("pivotal-regate", text)
+        self.assertIn("/pivotal go trusted", text)
+        self.assertNotIn("Landed", text)
+
     def test_a_base_that_moved_since_the_seal_pushes_nothing_and_refuses_the_regate_without_a_round_zero_pin(self):
         # R16 (this test used to assert a dispatch whose pin was minted from the live issue text: its dispatch assertions now
         # live in RegateRequestTest, with the carried pin). The land artifact has no pin, so the re-gate is refused, nothing is pushed.
@@ -741,8 +776,9 @@ class BaseTest(LandCase):
 
 
 class RegateRequestTest(unittest.TestCase):
-    """R21 and R16: the re-gate's request is the fix round's shape, sent with the same argv as publish's (Content-Type JSON),
-    and its pin is round 0's, carried in the land artifact: never the live issue text."""
+    """R21 and R16: the re-gate's request is the pivotal-regate shape (trust.REGATE_KEYS, engine/fix.py regate_payload), sent with
+    the same argv as publish's fix rounds (Content-Type JSON), and its pin is round 0's, carried in the land artifact: never the
+    live issue text. The branch is the issue's own stack branch, which trust accepts and nothing else (trust.regate_payload_problem)."""
 
     class Hub:
         def __init__(self):
@@ -752,9 +788,10 @@ class RegateRequestTest(unittest.TestCase):
             self.sent.append(args)
             return ""
 
-    def test_the_regate_request_is_the_fix_shape_with_the_carried_pin_and_the_json_content_type(self):
+    def test_the_regate_request_is_the_regate_shape_with_the_carried_pin_and_the_json_content_type(self):
         pin = "a" * 64
-        found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": pin}, prefix=["one"])
+        base = "c" * 40
+        found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": pin, "base_sha": base}, prefix=["one"])
         s = SimpleNamespace(repo=REPO, token="t" * 20)
         hub = self.Hub()
         with tempfile.TemporaryDirectory() as tmp:
@@ -763,14 +800,31 @@ class RegateRequestTest(unittest.TestCase):
             body = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(hub.sent, [tuple(fix.dispatch_argv(REPO, str(path)))])
         self.assertIn("Content-Type: application/json", hub.sent[0])
-        self.assertEqual(body["event_type"], "pivotal-fix")
-        self.assertEqual(tuple(body["client_payload"]), fix.PAYLOAD_KEYS)
-        self.assertEqual(body["client_payload"]["issue_pin"], pin)
-        self.assertEqual((body["client_payload"]["branch"], body["client_payload"]["round"]),
-                         (assemble.stack_branch(ISSUE), 1))
+        self.assertEqual(body["event_type"], "pivotal-regate")
+        self.assertEqual(tuple(body["client_payload"]), fix.REGATE_KEYS)
+        self.assertEqual(body["client_payload"],
+                         {"issue": ISSUE, "pin": pin, "branch": assemble.stack_branch(ISSUE), "sealed_sha": "b" * 40,
+                          "base_sha": base})
+        # The payload is the one trust accepts for that issue: the stack branch of it, and no other.
+        event = {"action": "pivotal-regate", "sender": {"login": "github-actions[bot]", "type": "Bot"},
+                 "repository": {"full_name": REPO}, "client_payload": body["client_payload"]}
+        self.assertEqual(trust.regate_payload_problem(event), "")
+        self.assertNotEqual(trust.regate_payload_problem({**event, "client_payload": {**body["client_payload"],
+                                                                                  "branch": "pivotal/issue-8/stack"}}), "")
+
+    def test_a_carried_pin_of_another_issue_is_not_sent_as_a_pin(self):
+        # carried_pin never mints one: a land artifact without the key, or with one that is not a digest, sends nothing.
+        for pin in ("", "abc", "A" * 64, "a" * 63, 7, None):
+            with self.subTest(pin=pin):
+                found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": pin, "base_sha": "c" * 40}, prefix=["one"])
+                hub = self.Hub()
+                s = SimpleNamespace(repo=REPO, token="t" * 20)
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.assertEqual(land.regate(hub, s, ISSUE, found, Path(tmp), land.carried_pin(found)), "pin")
+                self.assertEqual(hub.sent, [])
 
     def test_no_carried_pin_means_nothing_is_sent_and_the_word_is_pin(self):
-        found = land.Sealed(sha="b" * 40, run_id=7, land={}, prefix=["one"])  # assemble writes no pin today
+        found = land.Sealed(sha="b" * 40, run_id=7, land={}, prefix=["one"])  # an artifact from before the pin was carried
         hub = self.Hub()
         s = SimpleNamespace(repo=REPO, token="t" * 20)
         with tempfile.TemporaryDirectory() as tmp:
@@ -784,7 +838,7 @@ class RegateRequestTest(unittest.TestCase):
             def run(self, *args, timeout=0):
                 raise job.GhRefused("gh api was refused (HTTP 4xx) with exit 1")
 
-        found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": "a" * 64}, prefix=["one"])
+        found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": "a" * 64, "base_sha": "c" * 40}, prefix=["one"])
         s = SimpleNamespace(repo=REPO, token="t" * 20)
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(land.regate(Refused(), s, ISSUE, found, Path(tmp), land.carried_pin(found)), "dispatch")
@@ -795,7 +849,7 @@ class RegateRequestTest(unittest.TestCase):
             def run(self, *args, timeout=0):
                 raise job.JobError("gh api did not finish")
 
-        found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": "a" * 64}, prefix=["one"])
+        found = land.Sealed(sha="b" * 40, run_id=7, land={"issue_pin": "a" * 64, "base_sha": "c" * 40}, prefix=["one"])
         s = SimpleNamespace(repo=REPO, token="t" * 20)
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(land.regate(Silent(), s, ISSUE, found, Path(tmp), land.carried_pin(found)), "unknown")
@@ -1341,7 +1395,7 @@ class Round1Test(LandCase):
         (Path(old) / "land.json").write_bytes(raw)
         self.w["land_dir"] = Path(old)
         self.w["check_runs"] = [self.seal_run(summary=seal.summary(hashlib.sha256(raw).hexdigest(), self.land["positions"]))]
-        self.assertIn("version must be 2", self.refuses("land_invalid"))
+        self.assertIn(f"version must be {assemble.LAND_VERSION}", self.refuses("land_invalid"))
 
     # --- F9: the download is bounded
 

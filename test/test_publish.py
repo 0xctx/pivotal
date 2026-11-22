@@ -81,7 +81,7 @@ class PublishCase(AssembleCase):
             "target": "", "reviewed_by": "",
         }
         land = {
-            "version": 2, "issue": ISSUE, "base_sha": self.base, "baseline": "green",
+            "version": assemble.LAND_VERSION, "issue": ISSUE, "base_sha": self.base, "baseline": "green", "issue_pin": "",
             "bundle": {"name": assemble.BUNDLE, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)},
             "has_stack": False, "positions": [], "slices": [entry],
         }
@@ -520,7 +520,8 @@ class RefusalTest(PublishCase):
         self.artifact("lone", self.patch_of({".github/x.yml": "a: b\n"}))
         out = self.root / "nodraft"
         out.mkdir()
-        land = {"version": 2, "issue": ISSUE, "base_sha": self.base, "baseline": "green", "bundle": None, "has_stack": False,
+        land = {"version": assemble.LAND_VERSION, "issue": ISSUE, "base_sha": self.base, "baseline": "green", "issue_pin": "",
+                "bundle": None, "has_stack": False,
                 "positions": [], "slices": [{"id": "lone", "outcome": "blocked", "reason": "workflow_change", "candidate": False,
                                               "branch": None, "head": None, "commits": [], "built_by": "", "gate": "", "fell_back": [],
                                               "score": None, "target": "", "reviewed_by": ""}]}
@@ -1069,7 +1070,8 @@ class ResultLineTest(unittest.TestCase):
 
     def test_n10_a_candidate_outside_a_stack_is_not_a_land_json_so_candidate_only_is_never_written(self):
         """It was documented as reachable by a hand-made land.json; check_land makes `positions` exactly the candidates."""
-        data = {"version": 2, "issue": ISSUE, "base_sha": "a" * 40, "baseline": "green", "has_stack": False, "positions": [],
+        data = {"version": assemble.LAND_VERSION, "issue": ISSUE, "base_sha": "a" * 40, "baseline": "green", "issue_pin": "",
+                "has_stack": False, "positions": [],
                 "bundle": {"name": "pivotal.bundle", "sha256": "b" * 64, "bytes": 5},
                 "slices": [{"id": "one", "outcome": "candidate", "reason": "stacked", "candidate": True, "branch": f"pivotal/issue-{ISSUE}/stack",
                             "head": "c" * 40, "commits": ["c" * 40], "built_by": "claude:anthropic/sonnet", "gate": "green", "fell_back": [],

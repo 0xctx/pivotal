@@ -26,6 +26,11 @@ from engine import trust  # noqa: E402
 
 CALLER = (ROOT / "templates" / "caller.yml").read_text(encoding="utf-8")
 SHA = "1234567890abcdef1234567890abcdef12345678"
+OLD = "abcdef1234567890abcdef1234567890abcdef12"  # the pin a caller carries before piv upgrade moves it
+OTHER_OLD = "0987654321fedcba0987654321fedcba09876543"  # a second repo, on its own older pin
+OTHER = "0xctx/piv-other"  # a second managed repo
+FORK = "a/b"  # an engine a caller may pin instead of the default one
+OWNER = "0xctx"
 ZEROS = "0" * 40
 REPO = "0xctx/piv-sandbox"
 WORKFLOW = f"repos/{REPO}/contents/.github/workflows/pivotal.yml"
@@ -593,6 +598,288 @@ class ProtectedBranchTest(PivTest):
         self.assertEqual(self.piv(REPO, "--check", "npm test"), 1)
         self.assertIn("HTTP 500", self.err.getvalue())
         self.assertNotIn("pull request", self.err.getvalue())
+
+
+class UpgradeTest(PivTest):
+    """piv upgrade (the release rule): one line per repo, and a caller is written only when it differs.
+
+    The fake gh is the one the init tests use, so every call is checked against the flags the real gh has. A repo
+    whose caller cannot be read, or is not Pivotal's, or whose branch refuses the write, is refused by name and the
+    others still run. No variable, secret or label is ever touched.
+    """
+
+    def upgrade(self, *args: str, env: dict[str, str] | None = None) -> int:
+        return cli.main(["upgrade", *args], self.gh.env() if env is None else env, self.out, self.err)
+
+    def text(self) -> str:
+        return self.out.getvalue() + self.err.getvalue()
+
+    def pin(self, engine: str = init.ENGINE_REPO, sha: str = OLD) -> str:
+        """A caller file as init writes it, pinned to ``sha`` of ``engine``."""
+        return init.render_caller(CALLER, sha, engine)
+
+    def route_release(self, *, sha: str = SHA, tag: str = "v1.0.0", engine: str = init.ENGINE_REPO) -> None:
+        self.gh.route(f"api repos/{engine}/releases/latest", fakegh.ok(json.dumps({"tag_name": tag})))
+        self.gh.route(f"api repos/{engine}/commits/{tag}", fakegh.ok(json.dumps({"sha": sha})))
+
+    def route_template(self, engine: str = init.ENGINE_REPO, template: str = CALLER) -> None:
+        self.gh.route(f"repos/{engine}/contents/{init.CALLER_PATH}?ref={SHA}", fakegh.ok(template))
+
+    def route_caller(self, repo: str, *texts: str) -> None:
+        """The repo's caller file, answered in order: a second answer is what a write left behind."""
+        blobs = [
+            {"sha": f"b10b{n}", "content": base64.b64encode(text.encode()).decode()}
+            for n, text in enumerate(texts)
+        ]
+        self.gh.route(
+            f"api repos/{repo}/contents/{init.WORKFLOW_PATH}",
+            *(fakegh.ok(json.dumps(blob)) for blob in blobs),
+        )
+
+    def reads(self, repo: str) -> list[dict]:
+        """The reads of one repo's caller file (a write of it is not a read)."""
+        path = f"repos/{repo}/contents/{init.WORKFLOW_PATH}"
+        return [
+            call for call in self.gh.calls()
+            if call["args"][:1] == ["api"] and "-X" not in call["args"] and path in call["args"]
+        ]
+
+    def api_calls(self, needle: str) -> list[dict]:
+        """The gh api calls with ``needle`` in one of their arguments."""
+        return [
+            call for call in self.gh.calls()
+            if call["args"][:1] == ["api"] and any(needle in arg for arg in call["args"])
+        ]
+
+    def route_put(self, repo: str, *answers: dict) -> None:
+        self.gh.route(f"api -X PUT repos/{repo}/contents/{init.WORKFLOW_PATH}", *answers)
+
+    def route_owner(self, owner: str, *repos: str) -> None:
+        self.gh.route(
+            f"search repos --owner {owner} --topic {init.TOPIC}",
+            fakegh.ok(json.dumps([{"fullName": name} for name in repos])),
+        )
+
+    def puts(self) -> list[dict]:
+        """Every write of a caller file, in order."""
+        return [
+            json.loads(call["stdin"])
+            for call in self.gh.calls()
+            if call["args"][:2] == ["api", "-X"] and init.WORKFLOW_PATH in " ".join(call["args"])
+        ]
+
+    def written(self, body: dict) -> str:
+        return base64.b64decode(body["content"]).decode()
+
+    def test_a_caller_already_pinned_to_the_release_is_current_and_is_not_written(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin(sha=SHA))
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        self.assertEqual(self.out.getvalue().splitlines(), [f"piv upgrade {REPO}: current"])
+        self.assertEqual(self.puts(), [], "a caller that is already on the release is not rewritten")
+
+    def test_each_caller_is_read_once_and_then_compared(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin(sha=SHA))
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        self.assertEqual(len(self.reads(REPO)), 1, "the caller is read once, not once to parse it and again to compare")
+
+    def test_a_caller_pinned_to_an_older_release_is_updated_and_the_commit_names_both_pins(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        self.assertEqual(
+            self.out.getvalue().splitlines(), [f"piv upgrade {REPO}: updated {OLD[:12]} -> {SHA[:12]}"]
+        )
+        body = self.puts()[0]
+        self.assertEqual(body["message"], f"Update the Pivotal caller from {OLD[:12]} to {SHA[:12]}")
+        self.assertEqual(body["sha"], "b10b0", "the write replaces the file it read, by its blob sha")
+        written = self.written(body)
+        self.assertEqual(written, self.pin(sha=SHA), "every pin is the release's commit")
+        self.assertNotIn(init.PIN_PLACEHOLDER, written)
+
+    def test_a_caller_a_protected_branch_refuses_is_refused_and_fails_the_run(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.fail("gh: Repository rule violations (HTTP 409)\n"))
+        self.assertEqual(self.upgrade(REPO), 1)
+        self.assertIn(f"piv upgrade {REPO}: refused: HTTP 409", self.out.getvalue())
+        self.assertIn("pull request", self.out.getvalue())
+        self.assertIn("Nothing else was changed", self.out.getvalue())
+
+    def test_a_repo_whose_caller_cannot_be_read_is_refused_and_fails_the_run(self):
+        self.route_release()
+        self.route_template()
+        self.gh.route(
+            f"api repos/{REPO}/contents/{init.WORKFLOW_PATH}", fakegh.fail("gh: Server Error (HTTP 500)\n")
+        )
+        self.assertEqual(self.upgrade(REPO), 1)
+        self.assertIn(f"piv upgrade {REPO}: refused:", self.out.getvalue())
+        self.assertIn("HTTP 500", self.out.getvalue())
+        self.assertEqual(self.puts(), [], "a repo that could not be read is not written")
+
+    def test_a_repo_with_no_caller_is_refused_because_it_is_not_set_up_by_init(self):
+        self.route_release()
+        self.route_template()
+        self.gh.route(f"api repos/{REPO}/contents/{init.WORKFLOW_PATH}", fakegh.not_found())
+        self.assertEqual(self.upgrade(REPO), 1)
+        self.assertIn("is missing", self.out.getvalue())
+        self.assertIn("not set up by piv init", self.out.getvalue())
+        self.assertEqual(self.puts(), [], "a caller is never created for a repo that has none")
+
+    def test_a_caller_that_is_not_pivotal_s_is_refused_and_left_alone(self):
+        self.route_release()
+        self.route_template()
+        theirs = "name: someone else's workflow\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n"
+        self.route_caller(REPO, theirs)
+        self.assertEqual(self.upgrade(REPO), 1)
+        self.assertIn(f"piv upgrade {REPO}: refused: caller {init.WORKFLOW_PATH} in {REPO}", self.out.getvalue())
+        self.assertEqual(self.puts(), [], "a caller that is not Pivotal's is never replaced")
+
+    def test_a_caller_that_pins_a_fork_keeps_its_engine_name(self):
+        self.route_release()
+        self.route_template(FORK)
+        self.route_caller(REPO, self.pin(engine=FORK))
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        self.assertEqual(
+            self.out.getvalue().splitlines(),
+            [f"piv upgrade {REPO}: updated {OLD[:12]} -> {SHA[:12]} (fork: {FORK})"],
+        )
+        written = self.written(self.puts()[0])
+        self.assertEqual(written, self.pin(engine=FORK, sha=SHA), "a fork keeps its name and takes the new pin")
+        self.assertNotIn(init.ENGINE_REPO, written)
+
+    def test_a_fork_that_does_not_have_the_release_is_refused_and_left_alone(self):
+        # The fork's template is read at the release's commit: one without it cannot be re-rendered, so it is refused.
+        self.route_release()
+        self.route_caller(REPO, self.pin(engine=FORK))
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 1, self.text())
+        self.assertIn(f"piv upgrade {REPO}: refused:", self.out.getvalue())
+        self.assertEqual(self.puts(), [], "a caller that cannot be re-rendered is never written")
+
+    def test_a_second_run_prints_current_for_every_repo(self):
+        self.route_release()
+        self.route_template()
+        # The first run reads the old pin and writes the new one, so the second run reads the new pin: current.
+        self.route_caller(REPO, self.pin(), self.pin(sha=SHA))
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        self.assertEqual(self.out.getvalue().splitlines(), [f"piv upgrade {REPO}: updated {OLD[:12]} -> {SHA[:12]}"])
+        self.assertEqual(len(self.reads(REPO)), 1, "the first run reads the caller once")
+        self.out.seek(0)
+        self.out.truncate()
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        self.assertEqual(self.out.getvalue().splitlines(), [f"piv upgrade {REPO}: current"])
+        self.assertEqual(len(self.reads(REPO)), 2, "the second run reads it once too")
+        self.assertEqual(len(self.puts()), 1, "the second run writes nothing")
+
+    def test_a_template_that_cannot_be_fully_pinned_is_refused_before_any_write(self):
+        self.route_release()
+        self.route_template(template=CALLER.replace(f"factory.yml@{init.PIN_PLACEHOLDER}", "factory.yml@v1.0.0"))
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 1)
+        self.assertIn("not pinned", self.out.getvalue())
+        self.assertEqual(self.puts(), [], "a caller that is not fully pinned is never written")
+
+    def test_a_refused_repo_does_not_stop_the_others_and_the_run_fails(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_caller(OTHER, self.pin(sha=OTHER_OLD))
+        self.route_put(REPO, fakegh.fail("gh: Repository rule violations (HTTP 409)\n"))
+        self.route_put(OTHER, fakegh.ok("{}"))
+        self.route_owner(OWNER, REPO, OTHER)
+        self.assertEqual(self.upgrade("--owner", OWNER), 1)
+        lines = self.out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2, "one line per repo")
+        self.assertTrue(lines[0].startswith(f"piv upgrade {OTHER}: updated {OTHER_OLD[:12]} -> {SHA[:12]}"), lines)
+        self.assertTrue(lines[1].startswith(f"piv upgrade {REPO}: refused: HTTP 409"), lines)
+
+    def test_no_variable_secret_or_label_is_touched(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 0, self.text())
+        touched = [
+            call["args"]
+            for call in self.gh.calls()
+            if call["args"][:1] in ("variable", "secret", "label") or call["args"][:2] == ["repo", "edit"]
+        ]
+        self.assertEqual(touched, [], "piv upgrade moves a pin, and nothing else")
+
+    def test_the_release_is_resolved_once_and_the_callers_move_after_it(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_caller(OTHER, self.pin(sha=OTHER_OLD))
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.route_put(OTHER, fakegh.ok("{}"))
+        self.route_owner(OWNER, REPO, OTHER)
+        self.assertEqual(self.upgrade("--owner", OWNER), 0, self.text())
+        self.assertEqual(len(self.api_calls(f"repos/{init.ENGINE_REPO}/releases/latest")), 1)
+        self.assertEqual(
+            len(self.api_calls(f"repos/{init.ENGINE_REPO}/contents/{init.CALLER_PATH}?ref={SHA}")),
+            1,
+            "one template read for many repos, not one per repo",
+        )
+
+    def test_an_explicit_release_tag_is_resolved_and_the_latest_release_is_not_read(self):
+        self.gh.route(f"api repos/{init.ENGINE_REPO}/commits/v1.1", fakegh.ok(json.dumps({"sha": SHA})))
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO, "--release", "v1.1"), 0, self.text())
+        self.assertEqual(self.api_calls("releases/latest"), [])
+        self.assertEqual(
+            self.out.getvalue().splitlines(), [f"piv upgrade {REPO}: updated {OLD[:12]} -> {SHA[:12]}"]
+        )
+
+    def test_an_engine_with_no_release_fails_before_any_repo_is_written(self):
+        self.gh.route(f"api repos/{init.ENGINE_REPO}/releases/latest", fakegh.not_found())
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.assertEqual(self.upgrade(REPO), 1)
+        self.assertIn("has no release yet", self.err.getvalue())
+        self.assertEqual(self.puts(), [], "a release that cannot be resolved moves nothing")
+
+    def test_a_call_that_names_neither_repo_nor_owner_is_a_usage_error(self):
+        self.assertEqual(self.upgrade(), 2)
+        self.assertIn("not both and not neither", self.err.getvalue())
+        self.assertEqual(self.gh.calls(), [], "a usage error calls gh for nothing")
+
+    def test_a_call_that_names_both_repo_and_owner_is_a_usage_error(self):
+        self.assertEqual(self.upgrade(REPO, "--owner", OWNER), 2)
+        self.assertIn("not both and not neither", self.err.getvalue())
+        self.assertEqual(self.gh.calls(), [])
+
+    def test_a_malformed_repo_is_a_usage_error_before_any_call(self):
+        self.assertEqual(self.upgrade("not-a-repo"), 2)
+        self.assertIn("REPO must be owner/name", self.err.getvalue())
+        self.assertEqual(self.gh.calls(), [])
+
+    def test_a_repo_name_the_search_returns_is_checked_before_anything_is_written(self):
+        self.route_release()
+        self.route_template()
+        self.route_caller(REPO, self.pin())
+        self.route_put(REPO, fakegh.ok("{}"))
+        self.route_owner(OWNER, REPO, "you/../../evil")
+        self.assertEqual(self.upgrade("--owner", OWNER), 2)
+        self.assertIn("not owner/name", self.err.getvalue())
+        self.assertEqual(self.puts(), [], "a name that is not owner/name is never written to")
+
+    def test_a_malformed_owner_is_a_usage_error_before_any_call(self):
+        self.assertEqual(self.upgrade("--owner", "not an owner"), 2)
+        self.assertIn("--owner must be a GitHub login", self.err.getvalue())
 
 
 class FakeGhIsStrictTest(unittest.TestCase):

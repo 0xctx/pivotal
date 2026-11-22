@@ -301,7 +301,7 @@ def _check_pins(text: str, sha: str, engine: str) -> None:
 def init(req: Request, gh: Gh, env: Mapping[str, str], say: Callable[[str], None]) -> None:
     ref, sha = resolve_release(gh, req.release, req.engine)
     template = gh.api_text(f"repos/{req.engine}/contents/{CALLER_PATH}?ref={sha}")
-    caller = _plan_caller(req.repo, gh, render_caller(template, sha, req.engine), sha, req.update)
+    caller = plan_caller(req.repo, gh, render_caller(template, sha, req.engine), sha, req.update)
     variables = _plan_variables(req, gh)
     say(f"piv init {req.repo}: release {ref} (commit {sha[:12]}), check {req.check!r}")
     _set_variables(req.repo, gh, variables, say)
@@ -413,15 +413,21 @@ def _allow_actions_prs(repo: str, gh: Gh, say: Callable[[str], None]) -> None:
         )
 
 
-def _plan_caller(repo: str, gh: Gh, text: str, sha: str, update: bool) -> CallerWrite:
-    """What to do with the caller file, decided before any write. A differing file needs ``--update``."""
+def plan_caller(repo: str, gh: Gh, text: str, sha: str, update: bool, current: dict | None = None) -> CallerWrite:
+    """What to do with the caller file, decided before any write. A differing file needs ``--update``.
+
+    Shared by piv init and piv upgrade, which moves many callers to one release and so decides the same thing per repo.
+    ``current`` is the contents API answer for the file when the caller has already read it (piv upgrade reads it to
+    learn the engine name), so one repo's caller is read once, not twice.
+    """
     path = f"repos/{repo}/contents/{WORKFLOW_PATH}"
-    try:
-        current = gh.api_json(path)
-    except GhFailed as err:
-        if err.status != 404:
-            raise
-        return CallerWrite(text, sha, None, "created")
+    if current is None:
+        try:
+            current = gh.api_json(path)
+        except GhFailed as err:
+            if err.status != 404:
+                raise
+            return CallerWrite(text, sha, None, "created")
     existing = decoded_text(current, path)
     if existing == text:
         return CallerWrite(text, sha, None, "current")
@@ -445,6 +451,27 @@ def _write_caller(repo: str, gh: Gh, write: CallerWrite, say: Callable[[str], No
         message = f"Add the Pivotal caller at {short}"
     else:
         message = f"Update the Pivotal caller to {short}"
+    put_caller(
+        repo,
+        gh,
+        write,
+        message=message,
+        # A protected default branch refuses a direct commit with 403 or 409. The config is already in.
+        advice=(
+            f"Secrets and variables are already set. Open a pull request that adds {WORKFLOW_PATH} pinned to "
+            f"{short}; piv init does not open one yet."
+        ),
+    )
+    say(f"caller {WORKFLOW_PATH}: committed ({write.state}), pinned to {short}")
+
+
+def put_caller(repo: str, gh: Gh, write: CallerWrite, *, message: str, advice: str) -> None:
+    """The write of the caller file: one PUT of the rendered caller, with the blob sha of the file it replaces.
+
+    ``message`` is the commit message, which names what the caller did. A protected default branch, or a token that
+    cannot write, refuses the write with 403 or 409: that is a refusal with ``advice`` (the caller's own next step),
+    never a success. Every other failure is raised as it came.
+    """
     body: dict[str, str] = {"message": message, "content": _b64(write.text)}
     if write.blob is not None:
         body["sha"] = write.blob
@@ -453,14 +480,10 @@ def _write_caller(repo: str, gh: Gh, write: CallerWrite, say: Callable[[str], No
     except GhFailed as err:
         if err.status not in (403, 409):
             raise
-        # A protected default branch refuses a direct commit with one of these. The config is already in.
         raise PivError(
             f"HTTP {err.status} writing {WORKFLOW_PATH} to {repo}: the default branch is probably protected "
-            f"(or the token cannot write it), so the caller needs a pull request. Secrets and variables are "
-            f"already set. Open a pull request that adds {WORKFLOW_PATH} pinned to {short}; piv init does not "
-            f"open one yet."
+            f"(or the token cannot write it), so the caller needs a pull request. {advice}"
         ) from err
-    say(f"caller {WORKFLOW_PATH}: committed ({write.state}), pinned to {short}")
 
 
 def _changes(existing: str, text: str) -> str:

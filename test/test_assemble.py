@@ -1214,6 +1214,7 @@ class RefusalTest(AssembleCase):
             ("MATRIX", {"MATRIX": '[{"id":"../x","title":"t","goal":"g"}]'}),
             ("BASELINE", {"BASELINE": "yes"}), ("BASELINE", {"BASELINE": ""}), ("BASELINE", {"BASELINE": None}),
             ("KIND", {"KIND": None}), ("KIND", {"KIND": ""}), ("KIND", {"KIND": "Incident"}), ("KIND", {"KIND": "red-main"}),
+            ("ISSUE_PIN", {"ISSUE_PIN": "abc"}), ("ISSUE_PIN", {"ISSUE_PIN": "A" * 64}), ("ISSUE_PIN", {"ISSUE_PIN": " " * 64}),
             ("REPO_DIR", {"REPO_DIR": "relative"}), ("REPO_DIR", {"REPO_DIR": str(self.root / "nope")}),
             ("OUT_DIR", {"OUT_DIR": str(self.slices)}),
         ]
@@ -1262,7 +1263,31 @@ class LandSchemaTest(AssembleCase):
         text = (Path(self.last_env["OUT_DIR"]) / assemble.LAND).read_bytes()
         self.assertEqual(text, assemble.land_text(land))
         self.assertTrue(text.isascii() and text.endswith(b"\n"))
-        self.assertEqual(list(json.loads(text)), ["version", "issue", "base_sha", "baseline", "bundle", "has_stack", "positions", "slices"])
+        self.assertEqual(list(json.loads(text)), ["version", "issue", "base_sha", "baseline", "issue_pin", "bundle", "has_stack", "positions", "slices"])
+
+    def test_the_land_json_carries_the_pin_the_run_was_trusted_on(self):
+        """The land artifact carries round 0's pin of the issue text (plan's `issue_pin` output): the land job re-gates with it
+        (engine/land.py `carried_pin`), and a re-gate is never pinned to the live issue text."""
+        pin = "a" * 64
+        self.artifact("one", self.patch_of({"a.txt": "1\n"}))
+        code, _, stdout, _ = self.run_job("one", ISSUE_PIN=pin)
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(self.land()["issue_pin"], pin)
+        # A kind with no issue (an incident, an event) has no pin: the key is there and empty, so the land job refuses a
+        # re-gate instead of minting one from the live text.
+        code, _, stdout, _ = self.run_job("one", ISSUE_PIN="")
+        self.assertEqual(code, 0, stdout)
+        self.assertEqual(self.land()["issue_pin"], "")
+
+    def test_the_pin_is_validated_before_anything_is_written(self):
+        self.artifact("one", self.patch_of({"a.txt": "1\n"}))
+        for bad in ("abc", "a" * 63, "a" * 65, "A" * 64, "g" * 64, " " * 64, "a" * 64 + "\n"):
+            with self.subTest(pin=bad):
+                code, outputs, stdout, stderr = self.run_job("one", ISSUE_PIN=bad)
+                self.assertEqual(code, 1, stdout + stderr)
+                self.assertIn("ISSUE_PIN", stderr)
+                self.assertEqual(outputs, {})
+                self.assertFalse(Path(self.last_env["OUT_DIR"]).exists(), "a refusal makes no output")
 
     def test_every_mutation_is_refused(self):
         land = self.valid()
@@ -1280,7 +1305,8 @@ class LandSchemaTest(AssembleCase):
             "extra key": mutate(lambda d: d.update(extra=1)),
             "missing key": mutate(lambda d: d.pop("baseline")),
             "version 1": mutate(lambda d: d.update(version=1)),
-            "version 3": mutate(lambda d: d.update(version=3)),
+            "version 2": mutate(lambda d: d.update(version=2)),
+            "version 4": mutate(lambda d: d.update(version=4)),
             "version true": mutate(lambda d: d.update(version=True)),
             "issue 0": mutate(lambda d: d.update(issue=0)),
             "issue bool": mutate(lambda d: d.update(issue=True)),
@@ -1289,6 +1315,12 @@ class LandSchemaTest(AssembleCase):
             "upper base": mutate(lambda d: d.update(base_sha=land["base_sha"].upper())),
             "zero base": mutate(lambda d: d.update(base_sha="0" * 40)),
             "bad baseline": mutate(lambda d: d.update(baseline="maybe")),
+            "pin not a digest": mutate(lambda d: d.update(issue_pin="abc")),
+            "pin uppercase": mutate(lambda d: d.update(issue_pin="A" * 64)),
+            "pin with a newline": mutate(lambda d: d.update(issue_pin="a" * 64 + "\n")),
+            "pin not text": mutate(lambda d: d.update(issue_pin=7)),
+            "pin null": mutate(lambda d: d.update(issue_pin=None)),
+            "no pin key": mutate(lambda d: d.pop("issue_pin")),
             "no slices": mutate(lambda d: d.update(slices=[])),
             "seven slices": mutate(lambda d: d.update(slices=[dict(d["slices"][0], id=f"s{i}", branch=f"pivotal/issue-7/s{i}") for i in range(7)])),
             "slice extra key": mutate(lambda d: d["slices"][0].update(extra=1)),

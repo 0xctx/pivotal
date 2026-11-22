@@ -87,6 +87,7 @@ def run(
     if repo is not None:
         init.checked_repo(repo)
     tally: Counter[str] = Counter()
+    releases = ReleaseList(gh)  # one read of the release list per invocation, reused for every repo (--all)
     say("piv doctor: your environment")
     tally[_say(claude_probe(env, probe_claude), say)] += 1
     repos = [repo] if repo is not None else managed_repos(gh)
@@ -94,7 +95,7 @@ def run(
         say("no repo carries the pivotal topic for your account")
     for name in repos:
         say(f"piv doctor {name}")
-        for finding in repo_findings(gh, name, env):
+        for finding in repo_findings(gh, name, env, releases):
             tally[_say(finding, say)] += 1
     problems, unreadable = tally["problem"], tally["unknown"]
     if problems:
@@ -128,10 +129,35 @@ def managed_repos(gh: Gh) -> list[str]:
     return sorted(name for name in names if isinstance(name, str))
 
 
-def repo_findings(gh: Gh, repo: str, env: Mapping[str, str]) -> list[Finding]:
+class ReleaseList:
+    """The releases of an engine repo, read once per doctor invocation and reused for every repo.
+
+    ``--all`` therefore reads the list once, not once per repo. A caller that pins a fork is checked against the
+    fork's own releases, so the cache is keyed by engine.
+    """
+
+    def __init__(self, gh: Gh):
+        self.gh = gh
+        self._read: dict[str, list[tuple[str, str]] | PivError] = {}
+
+    def for_engine(self, engine: str) -> list[tuple[str, str]]:
+        """The engine's releases as ``(tag, commit sha)``, newest first. A read failure is raised again unchanged."""
+        if engine not in self._read:
+            try:
+                self._read[engine] = release_pins(self.gh, engine)
+            except PivError as err:
+                self._read[engine] = err
+        answer = self._read[engine]
+        if isinstance(answer, PivError):
+            raise answer
+        return answer
+
+
+def repo_findings(gh: Gh, repo: str, env: Mapping[str, str], releases: ReleaseList) -> list[Finding]:
     checks: tuple[tuple[str, str, Callable[[], list[Finding]]], ...] = (
         ("Actions", "the Actions settings", lambda: [actions_enabled(gh, repo)]),
         ("Caller", "the caller file", lambda: [caller(gh, repo)]),
+        ("Pin", "the engine's releases", lambda: [pin(gh, repo, releases)]),
         ("Level", "the PIVOTAL_LEVEL and PIVOTAL_CHECK variables", lambda: [level(gh, repo)]),
         ("Secrets", "the Actions secret names", lambda: secrets(gh, repo)),
         ("Actions minutes", "the repo's visibility and owner", lambda: [minutes(gh, repo)]),
@@ -192,20 +218,31 @@ def actions_enabled(gh: Gh, repo: str) -> Finding:
     raise PivError(f"gh api repos/{repo}/actions/permissions gave no enabled flag")
 
 
-def caller(gh: Gh, repo: str) -> Finding:
+def read_caller(gh: Gh, repo: str) -> tuple[str | None, str | None]:
+    """The caller's text, and why it is unusable: ``"missing"`` (a 404), ``"not UTF-8 text"``, or None.
+
+    A read failure other than 404 is raised: the Caller check turns it into its own problem.
+    """
     path = f"repos/{repo}/contents/{WORKFLOW}"
     try:
         current = gh.api_json(path)
     except GhFailed as err:
         if err.status != 404:
             raise
-        return problem(f"Caller: {WORKFLOW} is missing", f"run gh piv init {repo} --check {CHECK_HINT} to write it")
+        return None, "missing"
     content = current.get("content")
     try:
         text = base64.b64decode(content).decode("utf-8") if isinstance(content, str) else None
     except ValueError:
         text = None
-    if text is None:
+    return (text, None) if text is not None else (None, "not UTF-8 text")
+
+
+def caller(gh: Gh, repo: str) -> Finding:
+    text, missing = read_caller(gh, repo)
+    if missing == "missing":
+        return problem(f"Caller: {WORKFLOW} is missing", f"run gh piv init {repo} --check {CHECK_HINT} to write it")
+    if missing or text is None:
         return problem(
             f"Caller: {WORKFLOW} is not UTF-8 text",
             f"run gh piv init {repo} --check {CHECK_HINT} --update to write it",
@@ -254,6 +291,64 @@ def caller_flaw(text: str) -> tuple[str | None, str | None, str | None]:
     ):
         return "has a reference to an engine repo that is not pinned to one commit SHA on a uses: line", None, None
     return None, shas[0], engine
+
+
+def release_pins(gh: Gh, engine: str) -> list[tuple[str, str]]:
+    """The engine's releases as ``(tag, commit sha)``, newest first, drafts and prereleases left out.
+
+    The list is one read (``gh api repos/O/R/releases?per_page=100``); each release's tag is resolved to its commit
+    with one more, because the list's ``target_commitish`` is a branch name, not a SHA. The first entry is the
+    release ``init.resolve_release`` pins as the latest.
+    """
+    listed = gh.api_list(f"repos/{engine}/releases?per_page=100")
+    pins: list[tuple[str, str]] = []
+    for item in listed:
+        if not isinstance(item, dict):
+            raise PivError(f"gh api repos/{engine}/releases gave a list with something other than an object")
+        if item.get("draft") or item.get("prerelease"):
+            continue
+        tag = item.get("tag_name")
+        if not isinstance(tag, str) or not init.REF.fullmatch(tag):
+            raise PivError(f"a release of {engine} has no usable tag name")
+        sha = gh.api_json(f"repos/{engine}/commits/{tag}").get("sha")
+        if not isinstance(sha, str) or not init.SHA.fullmatch(sha):
+            raise PivError(f"the tag {tag} of {engine} is not a commit")
+        pins.append((tag, sha))
+    return pins
+
+
+def pin(gh: Gh, repo: str, releases: ReleaseList) -> Finding:
+    """The caller's pin against its engine's releases: the latest one, an older one, or none of them.
+
+    A caller that is missing or not pinned is the Caller check's finding, so this check says it skipped rather than
+    reporting the same problem twice. A release list that cannot be read is unknown, because the pin is not confirmed.
+    """
+    try:
+        text, missing = read_caller(gh, repo)
+    except PivError:
+        return skipped("pin: the caller could not be read, so the pin is not compared (see the Caller line)")
+    if missing or text is None:
+        return skipped("pin: the caller has no pin to compare (see the Caller line)")
+    flaw, sha, engine = caller_flaw(text)
+    if flaw or not sha or not engine:
+        return skipped("pin: the caller has no pin to compare (see the Caller line)")
+    try:
+        pins = releases.for_engine(engine)
+    except PivError as err:
+        detail = f" (HTTP {err.status})" if isinstance(err, GhFailed) and err.status else ""
+        return unknown(f"pin: the releases of {engine} could not be read{detail}, so the pin is not compared")
+    if not pins:
+        return unknown(f"pin: {engine} has no release, so the pin is not compared")
+    latest_tag, latest_sha = pins[0]
+    shown = sha[:12]
+    if sha == latest_sha:
+        return ok(f"pin: {shown} (release {latest_tag})")
+    if any(released == sha for _, released in pins[1:]):
+        return problem(
+            f"pin: {shown} (behind: latest is {latest_tag} at {latest_sha[:12]}; run piv upgrade {repo})",
+            f"gh piv upgrade {repo}",
+        )
+    return problem(f"pin: {shown} (not a release commit)", f"gh piv upgrade {repo}")
 
 
 def secret_names(gh: Gh, repo: str) -> set[str]:

@@ -462,7 +462,7 @@ class FactoryTest(unittest.TestCase):
             ("publish", "publish"): {"GH_TOKEN", "GH_REPO", "ISSUE", "BASE_SHA", "MATRIX", "ASSEMBLE_RESULT", "LAND_SHA256",
                                      "DEFAULT_BRANCH", "RUN_ID", "RUN_NUMBER", "RUN_ATTEMPT", "LAND_DIR", "WORK_DIR", "GATE_RESULT",
                                      "REVIEW_RESULT", "HAS_STACK", "KIND", "TRUSTED", "LEVEL", "PLANNED_LEVEL", "CHECK", "REVIEWER", "GATES_DIR", "REVIEWS_DIR", "SLICES_DIR", "ROUND", "ISSUE_PIN", "TARGET", "SCORES"},
-            ("assemble", "assemble"): {"ISSUE", "BASE_SHA", "MATRIX", "BASELINE", "KIND", "REPO_DIR", "SLICES_DIR", "REVIEWS_DIR", "OUT_DIR", "WORK_DIR"},
+            ("assemble", "assemble"): {"ISSUE", "ISSUE_PIN", "BASE_SHA", "MATRIX", "BASELINE", "KIND", "REPO_DIR", "SLICES_DIR", "REVIEWS_DIR", "OUT_DIR", "WORK_DIR"},
             ("build", "prepare"): {"SLICE", "ROUND", "BASE_SHA", "ISSUE", "SCORE", "TARGET"},
             ("build", "build"): {"SLICE", "ROUND", "BASE_SHA", "ISSUE", "SCORE", "TARGET", "PRESET", "LINE", "PRESET_JSON", "SETUP", "CHECK", "REPO_DIR",
                                  "BASE_DIR", "WORK_DIR", "ENGINE_DIR", "CONTAIN_SCOPE", "PIVOTAL_CONTAIN_USER_OK", "PIVOTAL_KAGGLE_URL",
